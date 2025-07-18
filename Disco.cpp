@@ -1,4 +1,6 @@
 #include "Disco.h"
+#include "gestor.h" // Incluir gestor.h para poder llamar sus funciones en handleDiskDependentOperation
+
 #include <iostream>
 #include <fstream>
 #include <limits>
@@ -8,15 +10,13 @@
 #include <string>
 #include <vector>
 #include <sstream>
-#include <iomanip>
-#include <map> // Para parsear parámetros
+#include <iomanip> // Para std::setw, std::setfill
 
 #ifdef _WIN32
     #include <direct.h> // Para _mkdir
     #define MKDIR(dir) _mkdir(dir)
     #include <io.h>     // Para _access
     #define EXISTS(path) (_access(path, 0) == 0)
-    #include <windows.h> // Para FindFirstFileA, FindNextFileA, DeleteFileA, RemoveDirectoryA
 #else
     #include <sys/stat.h> // Para mkdir
     #include <sys/types.h> // Para tipos como mode_t
@@ -25,1015 +25,911 @@
     #define EXISTS(path) (access(path, F_OK) == 0)
 #endif
 
-// Variables globales (mantener)
-Disco disco;
-TablaMetadataBypass g_esquemasCargados[MAX_NUM_TABLAS_SISTEMA];
-int g_numEsquemasCargados = 0;
+// --- Funciones Globales del Sistema (llamadas desde main.cpp) ---
 
-char columnas_seleccionadas[MAX_COLS][MAX_LEN];
-char columnas_registro[MAX_COLS][MAX_LEN];
-int num_columnas_seleccionadas = 0;
-int num_columnas_registro = 0;
-
-// Implementaciones de funciones de utilidad (mantener, o si se modifican, incluirlas aquí)
-bool crear_directorio(const char* path) {
-    if (EXISTS(path)) {
-        return true;
+void inicializarSistemaGestor() {
+    std::cout << "Inicializando sistema gestor...\n";
+    // Asegurarse de que la ruta base exista
+    if (!EXISTS(g_ruta_base_disco)) {
+        MKDIR(g_ruta_base_disco);
+        std::cout << "Directorio base de discos creado: " << g_ruta_base_disco << "\n";
     }
-    int result = MKDIR(path);
-    if (result == 0) {
-        //std::cout << "Directorio creado: " << path << std::endl;
-        return true;
+
+    // Inicializar bitmap de bloques a libre
+    for (int i = 0; i < MAX_BLOQUES; ++i) {
+        g_bitmap_bloques[i] = false;
+    }
+}
+
+void handleCreateNewDisk() {
+    std::cout << "Creando nuevo disco...\n";
+    std::cout << "Ingrese nombre del disco: ";
+    std::cin.getline(g_nombre_disco, NOMBRE_DISCO_LEN);
+
+    std::cout << "Ingrese número de platos (ej. 1): ";
+    std::cin >> g_num_platos;
+    std::cout << "Ingrese número de superficies por plato (ej. 2): ";
+    std::cin >> g_superficies_por_plato;
+    std::cout << "Ingrese número de pistas por superficie (ej. 1000): ";
+    std::cin >> g_pistas_por_superficie;
+    std::cout << "Ingrese número de sectores por pista (ej. 64): ";
+    std::cin >> g_sectores_por_pista;
+
+    // Calcular el total de bloques (asumiendo que 1 bloque = 8 sectores por defecto)
+    // Se asume que un bloque ocupa varios sectores contiguos en la pista.
+    // Simplificación: Total de bloques es el total de sectores / (TAM_BLOQUE_DEFAULT / TAM_SECTOR_DEFAULT)
+    g_total_bloques = (g_num_platos * g_superficies_por_plato * g_pistas_por_superficie * g_sectores_por_pista) / (g_tam_bloque / g_tam_sector);
+
+    std::cout << "Total de bloques calculado: " << g_total_bloques << "\n";
+
+    if (crear_disco_vacio()) {
+        std::cout << "Disco '" << g_nombre_disco << "' creado exitosamente.\n";
+        // Guardar el estado inicial del bitmap y metadatos
+        guardar_estado_sistema_disco();
     } else {
-        std::cerr << "Error al crear directorio: " << path << std::endl;
+        std::cerr << "Error al crear el disco.\n";
+    }
+}
+
+void handleLoadExistingDisk() {
+    std::cout << "Cargando disco existente...\n";
+    std::cout << "Ingrese nombre del disco a cargar: ";
+    std::cin.getline(g_nombre_disco, NOMBRE_DISCO_LEN);
+
+    // Intentar cargar el estado del sistema desde el archivo correspondiente
+    if (cargar_estado_sistema()) {
+        std::cout << "Disco '" << g_nombre_disco << "' cargado exitosamente.\n";
+    } else {
+        std::cerr << "Error: No se pudo cargar el disco '" << g_nombre_disco << "'. Asegúrese de que exista y su estado esté guardado.\n";
+        // Reiniciar variables si la carga falla
+        g_num_platos = 0;
+        g_numEsquemasCargados = 0;
+        for (int i = 0; i < MAX_BLOQUES; ++i) g_bitmap_bloques[i] = false;
+    }
+}
+
+bool handleLoadCsvData() {
+    std::cout << "Cargando datos desde archivo CSV.\n";
+    std::string csv_path;
+    std::cout << "Ingrese la ruta completa del archivo CSV (ej. C:/data/tabla.csv): ";
+    std::getline(std::cin, csv_path);
+
+    std::ifstream file(csv_path);
+    if (!file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo CSV: " << csv_path << "\n";
         return false;
     }
-}
 
-bool archivo_existe(const char* path) {
-    return EXISTS(path);
-}
-
-// Nota: Eliminar_directorio_recursivo es complejo y depende del SO.
-// Para Windows, la implementación actual con WIN32_FIND_DATAA es correcta.
-// Para Linux/Unix, se necesitaría opendir/readdir. Se mantiene la versión de Windows.
-bool eliminar_directorio_recursivo(const char* path) {
-    if (!EXISTS(path)) {
-        //std::cerr << "Advertencia: El directorio '" << path << "' no existe." << std::endl;
-        return true;
-    }
-
-#ifdef _WIN32
-    char pattern[MAX_PATH_OS]; // Usar MAX_PATH_OS
-    snprintf(pattern, MAX_PATH_OS, "%s\\*", path);
-
-    WIN32_FIND_DATAA data;
-    HANDLE hFind = FindFirstFileA(pattern, &data);
-
-    if (hFind == INVALID_HANDLE_VALUE) {
-        std::cerr << "Error: No se pudo abrir el directorio '" << path << "'." << std::endl;
+    std::string line;
+    std::getline(file, line); // Leer la primera línea (cabecera/esquema)
+    if (line.empty()) {
+        std::cerr << "Error: El archivo CSV está vacío o solo tiene una línea.\n";
+        file.close();
         return false;
     }
 
-    char ruta_completa[MAX_PATH_OS]; // Usar MAX_PATH_OS
+    // Extraer nombre de la tabla desde el nombre del archivo CSV
+    size_t last_slash = csv_path.find_last_of("/\\");
+    std::string filename_with_ext = (last_slash == std::string::npos) ? csv_path : csv_path.substr(last_slash + 1);
+    size_t dot_pos = filename_with_ext.find_last_of(".");
+    std::string table_name_str = (dot_pos == std::string::npos) ? filename_with_ext : filename_with_ext.substr(0, dot_pos);
 
-    do {
-        if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0)
-            continue;
+    char nombreTabla[MAX_LEN];
+    strncpy(nombreTabla, table_name_str.c_str(), MAX_LEN - 1);
+    nombreTabla[MAX_LEN - 1] = '\0';
 
-        snprintf(ruta_completa, MAX_PATH_OS, "%s\\%s", path, data.cFileName);
-
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!eliminar_directorio_recursivo(ruta_completa)) {
-                FindClose(hFind);
-                return false;
-            }
-        } else {
-            if (DeleteFileA(ruta_completa) == 0) {
-                std::cerr << "Error al eliminar archivo: " << ruta_completa << std::endl;
-                FindClose(hFind);
-                return false;
-            }
-        }
-
-    } while (FindNextFileA(hFind, &data));
-
-    FindClose(hFind);
-
-    if (RemoveDirectoryA(path) == 0) {
-        std::cerr << "Error al eliminar el directorio: " << path << std::endl;
-        return false;
-    }
-#else // Linux/Unix
-    // Implementación para Linux/Unix si es necesario
-    // Para simplificar, se asume Windows para la recursividad.
-    // En un entorno multi-plataforma real, se usarían funciones como `fts` o `nftw`.
-    std::cerr << "eliminar_directorio_recursivo no implementado para este SO." << std::endl;
-    return false;
-#endif
-
-    return true;
-}
-
-void construir_ruta_base_disco(char* buffer, const char* nombre_disco_param) {
-    snprintf(buffer, MAX_RUTA, "Discos/%s", nombre_disco_param);
-}
-
-void construir_ruta_plato(char* buffer, int idPlato) {
-    char ruta_base[MAX_RUTA];
-    construir_ruta_base_disco(ruta_base, disco.nombre);
-    snprintf(buffer, MAX_RUTA, "%s/Plato_%d", ruta_base, idPlato);
-}
-
-void construir_ruta_bloque(char* buffer) {
-    char ruta_base[MAX_RUTA];
-    construir_ruta_base_disco(ruta_base, disco.nombre);
-    snprintf(buffer, MAX_RUTA, "%s/Bloques", ruta_base);
-}
-
-void construir_ruta_bloque_individual(char* buffer, int idBloque) {
-    char ruta_bloques_dir[MAX_RUTA];
-    construir_ruta_bloque(ruta_bloques_dir);
-    snprintf(buffer, MAX_RUTA, "%s/Bloque_%d.txt", ruta_bloques_dir, idBloque);
-}
-
-void construir_ruta_superficie(char* buffer, int idPlato, int idSuperficie) {
-    char ruta_plato[MAX_RUTA];
-    construir_ruta_plato(ruta_plato, idPlato);
-    snprintf(buffer, MAX_RUTA, "%s/Superficie_%d", ruta_plato, idSuperficie);
-}
-
-void construir_ruta_pista(char* buffer, int idPlato, int idSuperficie, int idPista) {
-    char ruta_superficie[MAX_RUTA];
-    construir_ruta_superficie(ruta_superficie, idPlato, idSuperficie);
-    snprintf(buffer, MAX_RUTA, "%s/Pista_%d", ruta_superficie, idPista);
-}
-
-void construir_ruta_sector_completa(char* buffer, int idPlato, int idSuperficie, int idPista, int idSector) {
-    char ruta_pista[MAX_RUTA];
-    construir_ruta_pista(ruta_pista, idPlato, idSuperficie, idPista);
-    snprintf(buffer, MAX_RUTA, "%s/Sector_%d.txt", ruta_pista, idSector);
-}
-
-// --- MODIFICACIONES PARA ALMACENAMIENTO EN FORMATO DE TEXTO NORMAL ---
-
-// Helpers para CabeceraBloque (serialización de SlotMetadata)
-std::string slotMetadataToString(const CabeceraBloque::SlotMetadata& slot) {
-    std::stringstream ss;
-    ss << slot.offset << "," << slot.tam << "," << (slot.libre ? "1" : "0") << "," << slot.idTablaRegistro;
-    return ss.str();
-}
-
-CabeceraBloque::SlotMetadata stringToSlotMetadata(const std::string& s) {
-    CabeceraBloque::SlotMetadata slot;
-    std::stringstream ss(s);
+    std::vector<std::string> column_names_vec;
+    std::stringstream ss(line);
     std::string segment;
-
-    std::getline(ss, segment, ','); slot.offset = std::stoi(segment);
-    std::getline(ss, segment, ','); slot.tam = std::stoi(segment);
-    std::getline(ss, segment, ','); slot.libre = (segment == "1");
-    std::getline(ss, segment, ',');
-    if (!segment.empty()) {
-        slot.idTablaRegistro = segment[0];
-    } else {
-        slot.idTablaRegistro = '\0';
-    }
-    return slot;
-}
-
-// Implementación de métodos de serialización/deserialización de CabeceraBloque
-std::string CabeceraBloque::serializeToString() const {
-    std::stringstream ss;
-    ss << "TablasMetadata:" << tablas_metadata << "\n";
-    ss << "NumTablas:" << numTablas << "\n";
-    ss << "NumSlotsUsados:" << numSlotsUsados << "\n";
-    ss << "EspacioLibreOffset:" << espacioLibreOffset << "\n";
-    ss << "SectorInicio:" << sectorInicio << "\n";
-
-    ss << "Slots:\n"; // Marcador para el inicio de los slots
-    for (int i = 0; i < numSlotsUsados; ++i) {
-        ss << slotMetadataToString(slots[i]) << "\n";
-    }
-    ss << "END_HEADER\n"; // Marcador para el fin de la cabecera
-    return ss.str();
-}
-
-void CabeceraBloque::deserializeFromString(const std::string& data) {
-    std::stringstream ss(data);
-    std::string line;
-    std::string key, value_str;
-
-    // Resetear el estado de la cabecera a valores por defecto
-    memset(tablas_metadata, 0, MAX_LEN);
-    numTablas = 0;
-    numSlotsUsados = 0;
-    espacioLibreOffset = TAM_BLOQUE_DEFAULT;
-    sectorInicio = -1;
-
-    // Parsear los campos principales de la cabecera
-    while (std::getline(ss, line)) {
-        if (line == "Slots:") { // Se encontró el marcador para los slots
-            break;
-        }
-        if (line == "END_HEADER") { // Fin prematuro de la cabecera
-            return;
-        }
-
-        size_t colon_pos = line.find(':');
-        if (colon_pos == std::string::npos) continue;
-
-        key = line.substr(0, colon_pos);
-        value_str = line.substr(colon_pos + 1);
-        if (!value_str.empty() && value_str[0] == ' ') {
-            value_str = value_str.substr(1); // Eliminar espacio inicial
-        }
-
-        if (key == "TablasMetadata") {
-            strncpy(tablas_metadata, value_str.c_str(), MAX_LEN - 1);
-            tablas_metadata[MAX_LEN - 1] = '\0';
-        } else if (key == "NumTablas") {
-            numTablas = std::stoi(value_str);
-        } else if (key == "NumSlotsUsados") {
-            numSlotsUsados = std::stoi(value_str);
-        } else if (key == "EspacioLibreOffset") {
-            espacioLibreOffset = std::stoi(value_str);
-        } else if (key == "SectorInicio") {
-            sectorInicio = std::stoi(value_str);
-        }
+    while(std::getline(ss, segment, ',')) {
+        column_names_vec.push_back(segment);
     }
 
-    // Ahora, procesar las líneas de metadatos de los slots
-    int current_slot_index = 0;
-    while (std::getline(ss, line)) {
-        if (line == "END_HEADER") {
-            break;
-        }
-        if (current_slot_index < MAX_SLOTS_POR_BLOQUE) {
-            slots[current_slot_index++] = stringToSlotMetadata(line);
-        } else {
-            std::cerr << "Advertencia: Demasiados slots en la cabecera del bloque para MAX_SLOTS_POR_BLOQUE." << std::endl;
-            break;
-        }
-    }
-    numSlotsUsados = current_slot_index; // Actualizar el contador de slots usados
-}
-
-// Modificación de funciones de disco físico para formato de texto
-bool guardar_parametros_disco() {
-    if (!disco.inicializado) {
-        std::cerr << "Error: Disco no inicializado, no se pueden guardar los parámetros." << std::endl;
+    if (column_names_vec.empty()) {
+        std::cerr << "Error: No se encontraron columnas en la cabecera del CSV.\n";
+        file.close();
         return false;
     }
 
-    char path_sector0[256];
-    construir_ruta_sector_completa(path_sector0, 0, 0, 0, 0);
+    char nombresColumnas[MAX_COLS][MAX_LEN];
+    char tiposColumnas[MAX_COLS][MAX_LEN]; // Los tipos se inferirán de los datos
+    int num_columnas = column_names_vec.size();
 
-    std::ofstream file(path_sector0, std::ios::trunc); // Sobrescribir el archivo
-    if (!file.is_open()) {
-        std::cerr << "Error: No se pudo abrir el archivo del sector 0 para guardar los parámetros." << std::endl;
+    if (num_columnas > MAX_COLS) {
+        std::cerr << "Advertencia: Demasiadas columnas en el CSV. Se procesarán solo las primeras " << MAX_COLS << ".\n";
+        num_columnas = MAX_COLS;
+    }
+
+    for (int i = 0; i < num_columnas; ++i) {
+        strncpy(nombresColumnas[i], column_names_vec[i].c_str(), MAX_LEN - 1);
+        nombresColumnas[i][MAX_LEN - 1] = '\0';
+        // Inicializar tipos a un valor por defecto o vacío
+        strncpy(tiposColumnas[i], "TEXTO", MAX_LEN - 1);
+        tiposColumnas[i][MAX_LEN - 1] = '\0';
+    }
+
+    // Intentar guardar el esquema
+    if (!guardarEsquema(nombreTabla, nombresColumnas, tiposColumnas, num_columnas)) {
+        std::cerr << "Error: No se pudo guardar el esquema de la tabla '" << nombreTabla << "'.\n";
+        file.close();
         return false;
     }
 
-    file << "nombre: " << disco.nombre << "\n";
-    file << "numPlatos: " << disco.numPlatos << "\n";
-    file << "numSuperficiesPorPlato: " << disco.numSuperficiesPorPlato << "\n";
-    file << "numPistasPorSuperficie: " << disco.numPistasPorSuperficie << "\n";
-    file << "numSectoresPorPista: " << disco.numSectoresPorPista << "\n";
-    file << "tamSector: " << disco.tamSector << "\n";
-    file << "tamBloque: " << disco.tamBloque << "\n";
-    file << "sectoresPorBloque: " << disco.sectoresPorBloque << "\n";
-    file << "capacidadTotalBytes: " << disco.capacidadTotalBytes << "\n";
-    file << "numTotalBloques: " << disco.numTotalBloques << "\n";
-    file << "inicializado: " << (disco.inicializado ? "true" : "false") << "\n";
-    file << "---END_PARAMS---\n"; // Marcador para el fin de los parámetros
+    std::cout << "Esquema de la tabla '" << nombreTabla << "' cargado con " << num_columnas << " columnas.\n";
 
-    file.close();
-
-    if (!file.good()) {
-        std::cerr << "Error al escribir los parámetros del disco en el archivo." << std::endl;
-        return false;
-    }
-
-    std::cout << "Parámetros del disco guardados en sector físico 0 (formato legible)." << std::endl;
-    return true;
-}
-
-bool cargar_parametros_disco(const char* nombre_disco_param) {
-    strncpy(disco.nombre, nombre_disco_param, NOMBRE_DISCO_LEN - 1);
-    disco.nombre[NOMBRE_DISCO_LEN - 1] = '\0';
-
-    char path_sector0[MAX_RUTA];
-    construir_ruta_sector_completa(path_sector0, 0, 0, 0, 0);
-
-    std::ifstream file(path_sector0);
-    if (!file.is_open()) {
-        std::cerr << "Error: No se pudo abrir el archivo del sector 0 para leer parámetros." << std::endl;
-        return false;
-    }
-
-    std::string line;
+    // Insertar registros
+    int registros_insertados = 0;
     while (std::getline(file, line)) {
-        if (line == "---END_PARAMS---") {
-            break;
-        }
+        if (line.empty()) continue;
 
-        std::stringstream ss(line);
-        std::string key;
-        std::string value_str;
+        char valores_registro_str[MAX_TAM_REGISTRO];
+        strncpy(valores_registro_str, line.c_str(), MAX_TAM_REGISTRO - 1);
+        valores_registro_str[MAX_TAM_REGISTRO - 1] = '\0';
 
-        ss >> key;
-        key.pop_back(); // Eliminar los dos puntos ':'
-
-        std::getline(ss, value_str);
-        if (!value_str.empty() && value_str[0] == ' ') {
-            value_str = value_str.substr(1);
-        }
-
-        if (key == "nombre") {
-            strncpy(disco.nombre, value_str.c_str(), NOMBRE_DISCO_LEN - 1);
-            disco.nombre[NOMBRE_DISCO_LEN - 1] = '\0';
-        } else if (key == "numPlatos") {
-            disco.numPlatos = std::stoi(value_str);
-        } else if (key == "numSuperficiesPorPlato") {
-            disco.numSuperficiesPorPlato = std::stoi(value_str);
-        } else if (key == "numPistasPorSuperficie") {
-            disco.numPistasPorSuperficie = std::stoi(value_str);
-        } else if (key == "numSectoresPorPista") {
-            disco.numSectoresPorPista = std::stoi(value_str);
-        } else if (key == "tamSector") {
-            disco.tamSector = std::stoi(value_str);
-        } else if (key == "tamBloque") {
-            disco.tamBloque = std::stoi(value_str);
-        } else if (key == "sectoresPorBloque") {
-            disco.sectoresPorBloque = std::stoi(value_str);
-        } else if (key == "capacidadTotalBytes") {
-            disco.capacidadTotalBytes = std::stoll(value_str);
-        } else if (key == "numTotalBloques") {
-            disco.numTotalBloques = std::stoi(value_str);
-        } else if (key == "inicializado") {
-            disco.inicializado = (value_str == "true");
-        }
-    }
-    file.close();
-
-    if (disco.numTotalBloques > MAX_BLOQUES) {
-        std::cerr << "Error: El disco tiene demasiados bloques. (Cargado de archivo: " << disco.numTotalBloques << ", MAX_BLOQUES: " << MAX_BLOQUES << ")\n";
-        return false;
-    }
-
-    // Asegurarse de que bitmapBloquesLibres esté asignado antes de intentar cargarlo
-    if (disco.bitmapBloquesLibres == nullptr && disco.numTotalBloques > 0) {
-        // En tu inicialización de Disco, asegúrate de hacer:
-        // disco.bitmapBloquesLibres = new int[MAX_BLOQUES];
-        // En el destructor o al eliminar disco, recuerda:
-        // delete[] disco.bitmapBloquesLibres;
-        // Si no es dinámico y es un array global, esta comprobación no aplica así.
-        // Asumiendo que es dinámico y asignado en `inicializarSistemaGestor()` o similar.
-    }
-
-    std::cout << "Parámetros del disco cargados desde sector físico 0." << std::endl;
-    return true;
-}
-
-bool guardar_bitmap_bloques_libres() {
-    if (!disco.inicializado || disco.bitmapBloquesLibres == nullptr) {
-        std::cerr << "Error: Disco no inicializado o bitmap no asignado." << std::endl;
-        return false;
-    }
-
-    char path_sector0[MAX_RUTA];
-    construir_ruta_sector_completa(path_sector0, 0, 0, 0, 0);
-
-    // Lee todo el contenido, encuentra el punto para insertar/reescribir el bitmap
-    std::string file_content;
-    std::ifstream read_file(path_sector0);
-    if (read_file.is_open()) {
-        std::stringstream ss_temp;
-        ss_temp << read_file.rdbuf();
-        file_content = ss_temp.str();
-        read_file.close();
-    } else {
-        std::cerr << "Error: No se pudo abrir el sector 0 para leer y guardar el bitmap." << std::endl;
-        return false;
-    }
-
-    size_t params_end_pos = file_content.find("---END_PARAMS---\n");
-    if (params_end_pos == std::string::npos) {
-        std::cerr << "Error: Marcador de fin de parámetros no encontrado en sector 0. No se puede guardar el bitmap." << std::endl;
-        return false;
-    }
-
-    // Calcula el inicio de la sección del bitmap
-    size_t bitmap_start_pos = params_end_pos + strlen("---END_PARAMS---\n");
-
-    std::ofstream write_file(path_sector0, std::ios::trunc); // Sobrescribir todo el archivo
-    if (!write_file.is_open()) {
-        std::cerr << "Error: No se pudo abrir el sector 0 para escribir el bitmap." << std::endl;
-        return false;
-    }
-
-    // Escribe la parte de los parámetros
-    write_file << file_content.substr(0, bitmap_start_pos);
-
-    // Escribe el bitmap en formato de texto
-    for (int i = 0; i < disco.numTotalBloques; ++i) {
-        write_file << (disco.bitmapBloquesLibres[i] ? '1' : '0');
-    }
-    write_file << "\n"; // Nueva línea después del bitmap
-
-    write_file.close();
-
-    std::cout << "Bitmap de bloques guardado en sector físico 0 (formato legible)." << std::endl;
-    return true;
-}
-
-bool cargar_bitmap_bloques_libres() {
-    if (!disco.inicializado || disco.bitmapBloquesLibres == nullptr) {
-        std::cerr << "Error: Disco no inicializado o bitmap no asignado." << std::endl;
-        return false;
-    }
-
-    char path_sector0[MAX_RUTA];
-    construir_ruta_sector_completa(path_sector0, 0, 0, 0, 0);
-
-    std::ifstream file(path_sector0);
-    if (!file.is_open()) {
-        std::cerr << "Error: No se pudo abrir el sector 0 para leer el bitmap." << std::endl;
-        return false;
-    }
-
-    // Saltar parámetros leyendo hasta "---END_PARAMS---"
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line == "---END_PARAMS---") {
-            break;
-        }
-    }
-
-    // Ahora lee la línea del bitmap
-    if (std::getline(file, line)) {
-        for (int i = 0; i < disco.numTotalBloques && i < line.length(); ++i) {
-            disco.bitmapBloquesLibres[i] = (line[i] == '1');
-        }
-    } else {
-        std::cerr << "Error: No se encontró la línea del bitmap en el sector 0." << std::endl;
-        return false;
-    }
-
-    file.close();
-
-    std::cout << "Bitmap cargado desde sector físico 0." << std::endl;
-    return true;
-}
-
-// Reimplementación de escribir_bloque_raw y cargar_bloque_raw para operar con archivos de texto completos de bloque
-bool escribir_bloque_raw(int idBloque, const std::string& block_content_text) {
-    if (!disco.inicializado) {
-        std::cerr << "Error: Disco no inicializado." << std::endl;
-        return false;
-    }
-
-    if (idBloque < 0 || idBloque >= disco.numTotalBloques) {
-        std::cerr << "Error: ID de bloque fuera de rango: " << idBloque << std::endl;
-        return false;
-    }
-
-    char ruta_bloque[MAX_RUTA];
-    construir_ruta_bloque_individual(ruta_bloque, idBloque);
-
-    std::ofstream file(ruta_bloque, std::ios::trunc); // Sobrescribir el archivo
-    if (!file.is_open()) {
-        std::cerr << "Error al abrir archivo de bloque para escritura: " << ruta_bloque << std::endl;
-        return false;
-    }
-    file << block_content_text;
-    file.close();
-
-    if (!file.good()) {
-        std::cerr << "Error al escribir el bloque en formato de texto." << std::endl;
-        return false;
-    }
-
-    marcar_bloque_ocupado(idBloque); // Esto sigue marcando el bitmap (que ahora es texto)
-    return true;
-}
-
-std::string cargar_bloque_raw(int idBloque) {
-    std::string block_content_text = "";
-    if (!disco.inicializado) {
-        std::cerr << "Error: Disco no inicializado." << std::endl;
-        return block_content_text;
-    }
-
-    if (idBloque < 0 || idBloque >= disco.numTotalBloques) {
-        std::cerr << "Error: ID de bloque fuera de rango: " << idBloque << std::endl;
-        return block_content_text;
-    }
-
-    char ruta_bloque[MAX_RUTA];
-    construir_ruta_bloque_individual(ruta_bloque, idBloque);
-
-    std::ifstream file(ruta_bloque);
-    if (!file.is_open()) {
-        //std::cerr << "Error al abrir archivo de bloque para lectura: " << ruta_bloque << std::endl;
-        return block_content_text; // Devolver string vacío en caso de error o archivo no existente
-    }
-
-    std::stringstream ss;
-    ss << file.rdbuf(); // Leer todo el contenido del archivo en el stringstream
-    file.close();
-
-    block_content_text = ss.str();
-    return block_content_text;
-}
-
-
-// --- Implementación de BufferManager ---
-
-// Constructor del BufferManager
-BufferManager::BufferManager(int max_pages_param, const std::string& blocks_dir_path, BufferAlgorithm algo)
-    : max_pages(max_pages_param), blocks_directory_path(blocks_dir_path), selected_algorithm(algo), current_time_tick(0), clock_hand(0) {
-    buffer_pool.resize(max_pages);
-    for (int i = 0; i < max_pages; ++i) {
-        buffer_pool[i].frame_id = i;
-        buffer_pool[i].page_id = -1; // -1 indica frame vacío
-        buffer_pool[i].dirty_bit = false;
-        buffer_pool[i].pin_count = 0;
-        buffer_pool[i].ref_bit = 0;
-        buffer_pool[i].last_used = 0;
-        buffer_pool[i].data = ""; // Inicializar con string vacío
-    }
-    // La ruta del directorio del buffer es fija dentro de "Discos"
-    this->buffer_directory_path = "Discos/buffer";
-    initializeBufferDirectory(); // Asegurarse de que el directorio del buffer exista
-}
-
-// Destructor del BufferManager: Vacía todas las páginas sucias
-BufferManager::~BufferManager() {
-    for (int i = 0; i < max_pages; ++i) {
-        if (buffer_pool[i].dirty_bit) {
-            flushPage(i);
-        }
-    }
-}
-
-// Inicializa el directorio "Discos/buffer"
-void BufferManager::initializeBufferDirectory() {
-    if (!crear_directorio("Discos")) {
-        std::cerr << "Error: No se pudo crear el directorio 'Discos'.\n";
-        return;
-    }
-    if (!crear_directorio(buffer_directory_path.c_str())) {
-        std::cerr << "Error: No se pudo crear el directorio del buffer: " << buffer_directory_path << "\n";
-    }
-}
-
-// Construye la ruta al archivo de una página en el directorio del buffer
-std::string BufferManager::getBufferFilePath(int page_id) {
-    return buffer_directory_path + "/BufferPage_" + std::to_string(page_id) + ".txt";
-}
-
-// Encuentra un frame libre en el buffer pool
-int BufferManager::findFreeFrame() {
-    for (int i = 0; i < max_pages; ++i) {
-        if (buffer_pool[i].page_id == -1) {
-            return i;
-        }
-    }
-    return -1; // No hay frames libres
-}
-
-// Algoritmo de reemplazo LRU
-int BufferManager::findLRUPage() {
-    int lru_frame = -1;
-    int min_time = -1;
-
-    for (int i = 0; i < max_pages; ++i) {
-        if (buffer_pool[i].pin_count == 0) { // Solo considera páginas no pineadas
-            if (lru_frame == -1 || buffer_pool[i].last_used < min_time) {
-                min_time = buffer_pool[i].last_used;
-                lru_frame = i;
-            }
-        }
-    }
-    return lru_frame;
-}
-
-// Algoritmo de reemplazo Clock
-int BufferManager::findClockPage() {
-    int start_frame = clock_hand;
-    while (true) {
-        if (buffer_pool[clock_hand].pin_count == 0) { // Si no está pineada
-            if (buffer_pool[clock_hand].ref_bit == 1) {
-                buffer_pool[clock_hand].ref_bit = 0; // Segunda oportunidad
-            } else {
-                return clock_hand; // Encontró una página para desalojar
-            }
-        }
-        clock_hand = (clock_hand + 1) % max_pages; // Mover la manecilla
-        if (clock_hand == start_frame) {
-            // Si después de un ciclo completo no se encontró nada, todas están pineadas
-            bool all_pinned = true;
-            for(int i=0; i<max_pages; ++i) {
-                if (buffer_pool[i].pin_count == 0) {
-                    all_pinned = false;
-                    break;
-                }
-            }
-            if (all_pinned) return -1; // Todas las páginas están pineadas, no se puede desalojar
-        }
-    }
-}
-
-// Pin a page: Obtiene la página del disco si no está en el buffer y la pinea
-std::string BufferManager::pinPage(int page_id, char mode) {
-    // 1. Verificar si la página ya está en el buffer
-    for (int i = 0; i < max_pages; ++i) {
-        if (buffer_pool[i].page_id == page_id) {
-            buffer_pool[i].pin_count++;
-            if (selected_algorithm == BufferAlgorithm::LRU) {
-                buffer_pool[i].last_used = ++current_time_tick;
-            } else if (selected_algorithm == BufferAlgorithm::CLOCK) {
-                buffer_pool[i].ref_bit = 1;
-            }
-            if (mode == 'w' || mode == 'W') {
-                buffer_pool[i].dirty_bit = true;
-            }
-            std::cout << "Página " << page_id << " ya en buffer (frame " << i << "). Pin_count: " << buffer_pool[i].pin_count << "\n";
-            return buffer_pool[i].data;
-        }
-    }
-
-    // 2. La página no está en el buffer. Encontrar un frame.
-    int frame_to_use = findFreeFrame();
-    if (frame_to_use == -1) { // No hay frame libre, se necesita desalojar
-        if (selected_algorithm == BufferAlgorithm::LRU) {
-            frame_to_use = findLRUPage();
-        } else if (selected_algorithm == BufferAlgorithm::CLOCK) {
-            frame_to_use = findClockPage();
-        }
-
-        if (frame_to_use == -1) {
-            std::cerr << "Error: No se pudo encontrar una página para desalojar. Buffer lleno y todas las páginas pineadas.\n";
-            return "";
-        }
-
-        // Si la página a desalojar está sucia, guardarla al disco primero
-        if (buffer_pool[frame_to_use].dirty_bit) {
-            std::cout << "Desalojando página sucia (frame " << frame_to_use << ", page " << buffer_pool[frame_to_use].page_id << "). Guardando en disco...\n";
-            flushPage(frame_to_use);
-        }
-        std::cout << "Desalojando página " << buffer_pool[frame_to_use].page_id << " del frame " << frame_to_use << ".\n";
-    }
-
-    // 3. Cargar la nueva página en el frame seleccionado
-    buffer_pool[frame_to_use].page_id = page_id;
-    buffer_pool[frame_to_use].pin_count = 1;
-    buffer_pool[frame_to_use].dirty_bit = (mode == 'w' || mode == 'W');
-    if (selected_algorithm == BufferAlgorithm::LRU) {
-        buffer_pool[frame_to_use].last_used = ++current_time_tick;
-    } else if (selected_algorithm == BufferAlgorithm::CLOCK) {
-        buffer_pool[frame_to_use].ref_bit = 1; // Nueva página, se marca el bit de referencia
-    }
-
-    // Leer el contenido del bloque del disco (carpeta Bloques)
-    std::string block_data_from_disk = cargar_bloque_raw(page_id);
-    if (block_data_from_disk.empty()) {
-        std::cerr << "Error: No se pudo cargar el bloque " << page_id << " desde el disco.\n";
-        // Restablecer el frame a vacío si la carga falla
-        buffer_pool[frame_to_use].page_id = -1;
-        buffer_pool[frame_to_use].pin_count = 0;
-        buffer_pool[frame_to_use].dirty_bit = false;
-        buffer_pool[frame_to_use].ref_bit = 0;
-        return "";
-    }
-    buffer_pool[frame_to_use].data = block_data_from_disk;
-
-    // Copiar los datos del bloque al directorio "Discos/buffer" para visualizar
-    std::ofstream buffer_file(getBufferFilePath(page_id), std::ios::trunc);
-    if (buffer_file.is_open()) {
-        buffer_file << block_data_from_disk;
-        buffer_file.close();
-        //std::cout << "Bloque " << page_id << " copiado al directorio del buffer.\n";
-    } else {
-        std::cerr << "Advertencia: No se pudo copiar el bloque " << page_id << " al directorio del buffer.\n";
-    }
-
-    std::cout << "Página " << page_id << " cargada en frame " << frame_to_use << ". Pin_count: " << buffer_pool[frame_to_use].pin_count << "\n";
-    return buffer_pool[frame_to_use].data;
-}
-
-// Despinea una página
-void BufferManager::unpinPage(int frame_id, bool is_dirty) {
-    if (frame_id < 0 || frame_id >= max_pages) {
-        std::cerr << "Error: Frame ID fuera de rango para despinear.\n";
-        return;
-    }
-    if (buffer_pool[frame_id].pin_count > 0) {
-        buffer_pool[frame_id].pin_count--;
-        if (is_dirty) {
-            buffer_pool[frame_id].dirty_bit = true;
-        }
-        std::cout << "Página en frame " << frame_id << " despineada. Pin_count: " << buffer_pool[frame_id].pin_count << " Dirty: " << (buffer_pool[frame_id].dirty_bit ? "true" : "false") << "\n";
-    } else {
-        std::cerr << "Advertencia: Intento de despinear página no pineada en frame " << frame_id << ".\n";
-    }
-}
-
-// Vacía una página sucia al disco
-void BufferManager::flushPage(int frame_id) {
-    if (frame_id < 0 || frame_id >= max_pages || buffer_pool[frame_id].page_id == -1) {
-        std::cerr << "Error: Frame ID inválido o página vacía para flush.\n";
-        return;
-    }
-    if (buffer_pool[frame_id].dirty_bit) {
-        // Escribir el contenido de la página de vuelta al archivo de bloque original
-        // La ruta completa del bloque se obtiene usando blocks_directory_path y page_id
-        // es_cribir_bloque_raw ya se encarga de esto.
-        if (escribir_bloque_raw(buffer_pool[frame_id].page_id, buffer_pool[frame_id].data)) {
-            buffer_pool[frame_id].dirty_bit = false;
-            std::cout << "Página " << buffer_pool[frame_id].page_id << " (frame " << frame_id << ") escrita a disco exitosamente.\n";
+        // Suponemos longitud variable por defecto para CSV
+        if (insertar_registro(nombreTabla, valores_registro_str, false)) { // false para longitud variable
+            registros_insertados++;
         } else {
-            std::cerr << "Error al escribir la página " << buffer_pool[frame_id].page_id << " (frame " << frame_id << ") al disco.\n";
+            std::cerr << "Advertencia: No se pudo insertar el registro: " << line << "\n";
         }
-    } else {
-        std::cout << "Página " << buffer_pool[frame_id].page_id << " (frame " << frame_id << ") no está sucia. No se requiere escritura.\n";
     }
+
+    file.close();
+    std::cout << "Se insertaron " << registros_insertados << " registros en la tabla '" << nombreTabla << "'.\n";
+    guardar_estado_sistema_disco(); // Guardar el bitmap actualizado después de insertar datos
+    return true;
 }
 
-// Imprime el estado actual del buffer pool
-void BufferManager::printBufferTable() {
-    std::cout << "\n--- Estado del Buffer Pool (" << (selected_algorithm == BufferAlgorithm::LRU ? "LRU" : "CLOCK") << ") ---\n";
-    std::cout << std::left << std::setw(8) << "Frame ID"
-              << std::setw(8) << "Page ID"
-              << std::setw(8) << "Pin Cnt"
-              << std::setw(8) << "Dirty"
-              << std::setw(8) << "Ref Bit"
-              << std::setw(8) << "LRU Time"
-              << "Contenido (primeros 50 chars)\n";
-    std::cout << "------------------------------------------------------------------------------------------------\n";
-
-    for (int i = 0; i < max_pages; ++i) {
-        std::cout << std::left << std::setw(8) << buffer_pool[i].frame_id
-                  << std::setw(8) << (buffer_pool[i].page_id == -1 ? "EMPTY" : std::to_string(buffer_pool[i].page_id))
-                  << std::setw(8) << buffer_pool[i].pin_count
-                  << std::setw(8) << (buffer_pool[i].dirty_bit ? "TRUE" : "FALSE")
-                  << std::setw(8) << buffer_pool[i].ref_bit
-                  << std::setw(8) << buffer_pool[i].last_used
-                  << (buffer_pool[i].data.length() > 50 ? buffer_pool[i].data.substr(0, 50) + "..." : buffer_pool[i].data) << "\n";
-    }
-    std::cout << "------------------------------------------------------------------------------------------------\n";
-}
-
-// Cambia el tamaño del buffer pool
-void BufferManager::resizeBuffer(int new_size) {
-    if (new_size < 1) {
-        std::cerr << "Error: El tamaño del buffer debe ser al menos 1.\n";
+void handleDiskDependentOperation(int opcion) {
+    // Verificar si un disco está cargado/creado antes de operar
+    if (g_num_platos == 0 && g_numEsquemasCargados == 0) {
+        std::cout << "No hay un disco creado o cargado. Por favor, cree o cargue un disco primero.\n";
         return;
     }
-    if (new_size < max_pages) {
-        std::cout << "Advertencia: Reduciendo el tamaño del buffer de " << max_pages << " a " << new_size << ". Las páginas pueden ser desalojadas.\n";
-        // Vaciar y desalojar páginas si es necesario al reducir el tamaño
-        for (int i = new_size; i < max_pages; ++i) {
-            if (buffer_pool[i].pin_count > 0) {
-                std::cerr << "Error: No se puede reducir el buffer mientras haya páginas pineadas en frames fuera del nuevo límite (frame " << i << ").\n";
-                return;
+
+    BufferManager buffer_manager(g_total_bloques, g_ruta_base_disco); // Crear BufferManager con el total de bloques y ruta base
+
+    switch (opcion) {
+        case 4: // Ejecutar consulta SQL (SELECT)
+            std::cout << "Ejecutando consulta SQL (SELECT)...\n";
+            leerEntrada(); // Desde gestor.cpp
+            if (validarTamano() != 1) { // Desde gestor.cpp
+                procesarConsulta(); // Desde gestor.cpp
+                analizarComandos(); // Desde gestor.cpp
+                analizarCondiciones(); // Desde gestor.cpp
+                imprimirArbolSemantico(); // Desde gestor.cpp (asumiendo su existencia)
+                validarArchivo(); // Desde gestor.cpp
+                seleccionar(buffer_manager); // Desde gestor.cpp
+                ingresar(buffer_manager); // Desde gestor.cpp
             }
-            if (buffer_pool[i].dirty_bit) {
-                flushPage(i);
-            }
-            // Opcional: borrar el archivo de buffer si se desaloja
-            std::string buffer_file_path = getBufferFilePath(buffer_pool[i].page_id);
-            if (archivo_existe(buffer_file_path.c_str())) {
-                remove(buffer_file_path.c_str());
-            }
-        }
+            break;
+        case 5: // Eliminar registros (simplificado, solo para demostración)
+            std::cout << "Funcionalidad de eliminación de registros no implementada completamente.\n";
+            // Lógica de eliminación de registros (a implementar por el usuario)
+            // Ejemplo: bool eliminar_registro(const char* nombre_tabla, const char* condicion);
+            break;
+        case 6: // Mostrar información de ocupación del disco
+            std::cout << "Mostrando información de ocupación del disco...\n";
+            mostrar_informacion_ocupacion_disco();
+            break;
+        case 7: // Mostrar árbol de creación del disco
+            std::cout << "Mostrando árbol de creación del disco...\n";
+            mostrar_arbol_creacion_disco(g_ruta_base_disco, g_num_platos, g_superficies_por_plato, g_pistas_por_superficie);
+            break;
+        default:
+            std::cout << "Opción de disco dependiente inválida.\n";
+            break;
     }
-    buffer_pool.resize(new_size);
-    // Inicializar nuevos frames si el tamaño aumentó
-    for (int i = max_pages; i < new_size; ++i) {
-        buffer_pool[i].frame_id = i;
-        buffer_pool[i].page_id = -1;
-        buffer_pool[i].dirty_bit = false;
-        buffer_pool[i].pin_count = 0;
-        buffer_pool[i].ref_bit = 0;
-        buffer_pool[i].last_used = 0;
-        buffer_pool[i].data = "";
-    }
-    max_pages = new_size;
-    // Reset clock hand if shrinking and it's out of bounds
-    if (selected_algorithm == BufferAlgorithm::CLOCK && clock_hand >= max_pages) {
-        clock_hand = 0;
-    }
-    std::cout << "Tamaño del Buffer Pool cambiado a " << new_size << " páginas.\n";
 }
 
-// Establece el algoritmo de reemplazo
-void BufferManager::setAlgorithm(BufferAlgorithm algo) {
-    selected_algorithm = algo;
-    std::cout << "Algoritmo de reemplazo del Buffer Pool establecido a "
-              << (algo == BufferAlgorithm::LRU ? "LRU" : "CLOCK") << ".\n";
+void guardarEstadoSistema() {
+    std::cout << "Saliendo y guardando estado del sistema...\n";
+    guardar_estado_sistema_disco(); // Guarda el estado del disco (bitmap, metadatos)
+    // Aquí podrías añadir cualquier otra lógica para guardar el estado general del gestor si es necesario
 }
 
-// Actualiza la ruta de los bloques del disco
-void BufferManager::setBlocksDirectoryPath(const std::string& path) {
-    this->blocks_directory_path = path;
-    std::cout << "Ruta de bloques del Buffer Manager actualizada a: " << path << "\n";
+// --- Implementación de funciones de gestión de Disco ---
+
+// Helper para obtener la ruta de un directorio o archivo físico
+std::string obtener_ruta_disco_base() {
+    char ruta_completa[MAX_RUTA];
+    snprintf(ruta_completa, sizeof(ruta_completa), "%s/%s", g_ruta_base_disco, g_nombre_disco);
+    return std::string(ruta_completa);
 }
 
-// --- Resto de funciones de Disco.cpp (mantener y/o adaptar si usan las funciones de E/S de bloque) ---
+std::string obtener_ruta_plato(int idPlato) {
+    char ruta_completa[MAX_RUTA];
+    snprintf(ruta_completa, sizeof(ruta_completa), "%s/Plato%d", obtener_ruta_disco_base().c_str(), idPlato);
+    return std::string(ruta_completa);
+}
 
-// La función 'inicializar_estructura_disco_fisico' debe asegurar que 'disco.bitmapBloquesLibres' esté asignado.
-bool inicializar_estructura_disco_fisico(const char* nombre_disco_input, int platos_input, int superficies_input, int pistas_input, int sectores_input, int tamSector_input, int tamBloque_input) {
-    strncpy(disco.nombre, nombre_disco_input, NOMBRE_DISCO_LEN - 1);
-    disco.nombre[NOMBRE_DISCO_LEN - 1] = '\0';
-    disco.numPlatos = platos_input;
-    disco.numSuperficiesPorPlato = superficies_input;
-    disco.numPistasPorSuperficie = pistas_input;
-    disco.numSectoresPorPista = sectores_input;
-    disco.tamSector = tamSector_input;
-    disco.tamBloque = tamBloque_input;
-    disco.sectoresPorBloque = disco.tamBloque / disco.tamSector;
+std::string obtener_ruta_superficie(int idPlato, int idSuperficie) {
+    char ruta_completa[MAX_RUTA];
+    snprintf(ruta_completa, sizeof(ruta_completa), "%s/Superficie%d", obtener_ruta_plato(idPlato).c_str(), idSuperficie);
+    return std::string(ruta_completa);
+}
 
-    long long total_sectores = (long long)disco.numPlatos * disco.numSuperficiesPorPlato * disco.numPistasPorSuperficie * disco.numSectoresPorPista;
-    disco.capacidadTotalBytes = total_sectores * disco.tamSector;
-    disco.numTotalBloques = total_sectores / disco.sectoresPorBloque;
-    if (disco.numTotalBloques > MAX_BLOQUES) {
-        std::cerr << "Error: Demasiados bloques. Aumenta MAX_BLOQUES." << std::endl;
+std::string obtener_ruta_pista(int idPlato, int idSuperficie, int idPista) {
+    char ruta_completa[MAX_RUTA];
+    snprintf(ruta_completa, sizeof(ruta_completa), "%s/Pista%d.bin", obtener_ruta_superficie(idPlato, idSuperficie).c_str(), idPista);
+    return std::string(ruta_completa);
+}
+
+// Implementación de funciones de creación de directorios/archivos
+bool crear_directorio_plato(int idPlato) {
+    std::string path = obtener_ruta_plato(idPlato);
+    return MKDIR(path.c_str()) == 0;
+}
+
+bool crear_directorio_superficie(int idPlato, int idSuperficie) {
+    std::string path = obtener_ruta_superficie(idPlato, idSuperficie);
+    return MKDIR(path.c_str()) == 0;
+}
+
+bool crear_archivo_pista(int idPlato, int idSuperficie, int idPista) {
+    std::string path = obtener_ruta_pista(idPlato, idSuperficie, idPista);
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc); // Crear y truncar
+    if (!ofs.is_open()) {
+        std::cerr << "Error: No se pudo crear el archivo de pista: " << path << "\n";
         return false;
     }
+    // Inicializar el archivo de pista con ceros para el tamaño total de la pista (sectores * tam_sector)
+    std::vector<char> zeros(g_sectores_por_pista * g_tam_sector, 0);
+    ofs.write(zeros.data(), zeros.size());
+    ofs.close();
+    return true;
+}
 
-    // Si disco.bitmapBloquesLibres no está asignado, hacerlo aquí
-    if (disco.bitmapBloquesLibres == nullptr) {
-        disco.bitmapBloquesLibres = new int[MAX_BLOQUES]; // Asignación de memoria
-        if (disco.bitmapBloquesLibres == nullptr) {
-            std::cerr << "Error: No se pudo asignar memoria para el bitmap de bloques." << std::endl;
+bool crear_disco_vacio() {
+    std::string disk_base_path = obtener_ruta_disco_base();
+    if (!EXISTS(disk_base_path.c_str())) {
+        if (MKDIR(disk_base_path.c_str()) != 0) {
+            std::cerr << "Error al crear el directorio base del disco: " << disk_base_path << "\n";
             return false;
         }
     }
-    for (int i = 0; i < MAX_BLOQUES; ++i) { // Inicializar bitmap
-        disco.bitmapBloquesLibres[i] = 0;
-    }
 
-    if (!crear_directorio("Discos")) {
-        return false;
-    }
-
-    char ruta_base[MAX_RUTA];
-    construir_ruta_base_disco(ruta_base, disco.nombre);
-
-    if (archivo_existe(ruta_base)) {
-        std::cout << "El disco '" << disco.nombre << "' ya existe. Eliminando y recreando..." << std::endl;
-        if (!eliminar_directorio_recursivo(ruta_base)) {
-            std::cerr << "Error al eliminar el disco existente. Abortando." << std::endl;
-            return false;
+    for (int p = 0; p < g_num_platos; ++p) {
+        if (!crear_directorio_plato(p)) return false;
+        for (int s = 0; s < g_superficies_por_plato; ++s) {
+            if (!crear_directorio_superficie(p, s)) return false;
+            for (int t = 0; t < g_pistas_por_superficie; ++t) {
+                if (!crear_archivo_pista(p, s, t)) return false;
+            }
         }
     }
 
-    // Crear el directorio base del disco
-    if (!crear_directorio(ruta_base)) {
-        return false;
+    // Inicializar bitmap de bloques
+    for (int i = 0; i < g_total_bloques; ++i) {
+        g_bitmap_bloques[i] = false; // Todos libres al inicio
     }
-    // Crear el directorio de bloques dentro del disco
-    char ruta_bloques_dir[MAX_RUTA];
-    construir_ruta_bloque(ruta_bloques_dir); // Esto construye Discos/nombre_disco/Bloques
-    if (!crear_directorio(ruta_bloques_dir)) {
+    g_numEsquemasCargados = 0; // No hay tablas cargadas al inicio
+
+    return true;
+}
+
+// --- Funciones para cargar y guardar el estado del disco ---
+bool cargar_estado_sistema() {
+    std::string state_file_path = obtener_ruta_disco_base() + "/estado_sistema.txt";
+    std::ifstream state_file(state_file_path);
+    if (!state_file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo de estado del disco: " << state_file_path << "\n";
         return false;
     }
 
-    // Crear archivos de bloque vacíos
-    for (int i = 0; i < disco.numTotalBloques; ++i) {
-        char ruta_bloque_individual[MAX_RUTA];
-        construir_ruta_bloque_individual(ruta_bloque_individual, i);
-        std::ofstream bloque_file(ruta_bloque_individual);
-        if (!bloque_file.is_open()) {
-            std::cerr << "Error al crear archivo de bloque: " << ruta_bloque_individual << std::endl;
-            return false;
+    state_file >> g_num_platos >> g_superficies_por_plato >> g_pistas_por_superficie >> g_sectores_por_pista >> g_tam_sector >> g_tam_bloque >> g_total_bloques;
+
+    for (int i = 0; i < g_total_bloques; ++i) {
+        state_file >> g_bitmap_bloques[i];
+    }
+
+    state_file >> g_numEsquemasCargados;
+    for (int i = 0; i < g_numEsquemasCargados; ++i) {
+        state_file >> g_esquemasCargados[i].nombreTabla;
+        state_file >> g_esquemasCargados[i].num_columnas;
+        state_file >> g_esquemasCargados[i].num_registros;
+        state_file >> g_esquemasCargados[i].primer_bloque;
+        state_file >> g_esquemasCargados[i].longitud_fija;
+        state_file >> g_esquemasCargados[i].tam_registro;
+        for (int j = 0; j < g_esquemasCargados[i].num_columnas; ++j) {
+            state_file >> g_esquemasCargados[i].nombresColumnas[j];
+            state_file >> g_esquemasCargados[i].tiposColumnas[j];
         }
-        // Puedes escribir un marcador o dejarlo vacío si quieres
-        bloque_file.close();
     }
-
-    // Las estructuras de plato/superficie/pista/sector ahora son más conceptuales
-    // dado que los bloques son archivos individuales. Puedes mantener la creación
-    // de estas carpetas si deseas la jerarquía, pero los sectores no contendrán
-    // directamente partes de los bloques de datos.
-
-    disco.inicializado = true;
-    return guardar_parametros_disco() && guardar_bitmap_bloques_libres();
+    state_file.close();
+    return true;
 }
 
-bool inicializar_estructura_disco_fisico() {
-    if (!disco.inicializado) {
-        std::cerr << "Error: La estructura 'disco' no está inicializada con parámetros. Use la otra sobrecarga." << std::endl;
+bool guardar_estado_sistema_disco() {
+    std::string state_file_path = obtener_ruta_disco_base() + "/estado_sistema.txt";
+    std::ofstream state_file(state_file_path);
+    if (!state_file.is_open()) {
+        std::cerr << "Error: No se pudo crear/abrir el archivo de estado del disco para guardar: " << state_file_path << "\n";
         return false;
     }
-    return inicializar_estructura_disco_fisico(disco.nombre, disco.numPlatos, disco.numSuperficiesPorPlato, disco.numPistasPorSuperficie, disco.numSectoresPorPista,disco.tamSector, disco.tamBloque);
+
+    state_file << g_num_platos << " " << g_superficies_por_plato << " " << g_pistas_por_superficie << " " << g_sectores_por_pista << " " << g_tam_sector << " " << g_tam_bloque << " " << g_total_bloques << "\n";
+
+    for (int i = 0; i < g_total_bloques; ++i) {
+        state_file << g_bitmap_bloques[i] << " ";
+    }
+    state_file << "\n";
+
+    state_file << g_numEsquemasCargados << "\n";
+    for (int i = 0; i < g_numEsquemasCargados; ++i) {
+        state_file << g_esquemasCargados[i].nombreTabla << " "
+                   << g_esquemasCargados[i].num_columnas << " "
+                   << g_esquemasCargados[i].num_registros << " "
+                   << g_esquemasCargados[i].primer_bloque << " "
+                   << g_esquemasCargados[i].longitud_fija << " "
+                   << g_esquemasCargados[i].tam_registro << " ";
+        for (int j = 0; j < g_esquemasCargados[i].num_columnas; ++j) {
+            state_file << g_esquemasCargados[i].nombresColumnas[j] << " "
+                       << g_esquemasCargados[i].tiposColumnas[j] << " ";
+        }
+        state_file << "\n";
+    }
+    state_file.close();
+    return true;
 }
 
-// Las funciones escribir_sector_a_disco y leer_sector_desde_disco ya no se usan para el contenido de los bloques.
-// Si aún se usan para otras metadatos o propósito, se mantienen.
 
+// Nueva función para eliminar el disco físicamente
+bool eliminar_disco_fisico() {
+    std::string disk_path = obtener_ruta_disco_base();
+    if (!EXISTS(disk_path.c_str())) {
+        std::cout << "El disco '" << g_nombre_disco << "' no existe físicamente para eliminar.\n";
+        return true;
+    }
+
+    // Advertencia: Esta función elimina directorios y archivos.
+    std::cout << "ADVERTENCIA: ¿Está seguro de que desea eliminar el disco '" << g_nombre_disco << "' y todos sus datos? (s/N): ";
+    char confirm;
+    std::cin >> confirm;
+    if (confirm != 's' && confirm != 'S') {
+        std::cout << "Operación de eliminación cancelada.\n";
+        return false;
+    }
+
+    // Necesitarías una función para eliminar directorios no vacíos recursivamente.
+    // En Windows: rmdir /s /q <path>
+    // En Linux: rm -rf <path>
+    // Esto es un ejemplo conceptual, la implementación real depende del OS.
+    std::string command;
+    #ifdef _WIN32
+        command = "rmdir /s /q \"" + disk_path + "\"";
+    #else
+        command = "rm -rf \"" + disk_path + "\"";
+    #endif
+
+    int result = system(command.c_str());
+    if (result == 0) {
+        std::cout << "Disco '" << g_nombre_disco << "' eliminado físicamente.\n";
+        // Reiniciar variables globales relacionadas con el disco
+        g_num_platos = 0;
+        g_superficies_por_plato = 0;
+        g_pistas_por_superficie = 0;
+        g_sectores_por_pista = 0;
+        g_total_bloques = 0;
+        for (int i = 0; i < MAX_BLOQUES; ++i) g_bitmap_bloques[i] = false;
+        g_numEsquemasCargados = 0;
+        return true;
+    } else {
+        std::cerr << "Error al eliminar el disco físicamente. Código de error: " << result << "\n";
+        return false;
+    }
+}
+
+
+// Funciones de bajo nivel para sectores (implementadas, pero los bloques ahora manejan strings)
+bool escribir_sector_a_disco(int idPlato, int idSuperficie, int idPista, int idSector, const char* data) {
+    std::string pista_path = obtener_ruta_pista(idPlato, idSuperficie, idPista);
+    std::fstream file(pista_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo de pista para escribir sector: " << pista_path << "\n";
+        return false;
+    }
+    file.seekp(idSector * g_tam_sector);
+    file.write(data, g_tam_sector);
+    file.close();
+    return true;
+}
+
+bool leer_sector_desde_disco(int idPlato, int idSuperficie, int idPista, int idSector, char* buffer) {
+    std::string pista_path = obtener_ruta_pista(idPlato, idSuperficie, idPista);
+    std::fstream file(pista_path, std::ios::binary | std::ios::in);
+    if (!file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo de pista para leer sector: " << pista_path << "\n";
+        return false;
+    }
+    file.seekg(idSector * g_tam_sector);
+    file.read(buffer, g_tam_sector);
+    file.close();
+    return true;
+}
+
+// Obtiene las coordenadas físicas para un bloque dado
 void obtener_coordenadas_fisicas(int idBloque, int idSectorEnBloque, int* idPlato, int* idSuperficie, int* idPista, int* idSectorGlobal) {
-    long long sector_global_absoluto = (long long)idBloque * disco.sectoresPorBloque + idSectorEnBloque;
+    int bloques_por_pista = g_sectores_por_pista / (g_tam_bloque / g_tam_sector);
+    int bloques_por_superficie = bloques_por_pista * g_pistas_por_superficie;
+    int bloques_por_plato = bloques_por_superficie * g_superficies_por_plato;
 
-    int sectores_por_pista_total = disco.numSectoresPorPista;
-    int pistas_por_superficie_total = disco.numPistasPorSuperficie;
-    int superficies_por_plato_total = disco.numSuperficiesPorPlato;
+    *idPlato = idBloque / bloques_por_plato;
+    int rem_plato = idBloque % bloques_por_plato;
+    *idSuperficie = rem_plato / bloques_por_superficie;
+    int rem_superficie = rem_plato % bloques_por_superficie;
+    *idPista = rem_superficie / bloques_por_pista;
+    int rem_pista = rem_superficie % bloques_por_pista;
 
-    *idSectorGlobal = sector_global_absoluto;
-
-    *idPlato = (sector_global_absoluto / (sectores_por_pista_total * pistas_por_superficie_total * superficies_por_plato_total));
-    long long rem_plato = sector_global_absoluto % (sectores_por_pista_total * pistas_por_superficie_total * superficies_por_plato_total);
-
-    *idSuperficie = (rem_plato / (sectores_por_pista_total * pistas_por_superficie_total));
-    long long rem_superficie = rem_plato % (sectores_por_pista_total * pistas_por_superficie_total);
-
-    *idPista = (rem_superficie / sectores_por_pista_total);
-    // *idSectorEnPista = sector_global_absoluto % sectores_por_pista_total; // Este ya no es el global, es dentro de la pista.
+    // El sector inicial del bloque en la pista
+    int sector_inicial_bloque_en_pista = rem_pista * (g_tam_bloque / g_tam_sector);
+    *idSectorGlobal = sector_inicial_bloque_en_pista + idSectorEnBloque;
 }
 
+
+// Gestión del bitmap de bloques
 void marcar_bloque_ocupado(int idBloque) {
-    if (idBloque >= 0 && idBloque < disco.numTotalBloques && disco.bitmapBloquesLibres != nullptr) {
-        disco.bitmapBloquesLibres[idBloque] = 1; // 1 = ocupado
-        guardar_bitmap_bloques_libres(); // Guardar el bitmap después de cada cambio
-    } else {
-        std::cerr << "Advertencia: Intento de marcar bloque ocupado fuera de rango o bitmap nulo: " << idBloque << std::endl;
+    if (idBloque >= 0 && idBloque < g_total_bloques) {
+        g_bitmap_bloques[idBloque] = true;
     }
 }
 
 void marcar_bloque_libre(int idBloque) {
-    if (idBloque >= 0 && idBloque < disco.numTotalBloques && disco.bitmapBloquesLibres != nullptr) {
-        disco.bitmapBloquesLibres[idBloque] = 0; // 0 = libre
-        guardar_bitmap_bloques_libres(); // Guardar el bitmap después de cada cambio
-    } else {
-        std::cerr << "Advertencia: Intento de marcar bloque libre fuera de rango o bitmap nulo: " << idBloque << std::endl;
+    if (idBloque >= 0 && idBloque < g_total_bloques) {
+        g_bitmap_bloques[idBloque] = false;
     }
 }
 
 bool esta_bloque_ocupado(int idBloque) {
-    if (idBloque >= 0 && idBloque < disco.numTotalBloques && disco.bitmapBloquesLibres != nullptr) {
-        return disco.bitmapBloquesLibres[idBloque] == 1;
+    if (idBloque >= 0 && idBloque < g_total_bloques) {
+        return g_bitmap_bloques[idBloque];
     }
-    return false;
+    return true; // Si está fuera de rango, considerarlo como ocupado/no disponible
 }
 
 int encontrar_bloque_libre() {
-    if (!disco.inicializado || disco.bitmapBloquesLibres == nullptr) {
-        std::cerr << "Error: Disco no inicializado o bitmap nulo, no se puede encontrar bloque libre." << std::endl;
-        return -1;
+    for (int i = 0; i < g_total_bloques; ++i) {
+        if (!g_bitmap_bloques[i]) {
+            return i; // Retorna el ID del primer bloque libre
+        }
     }
-    for (int i = 0; i < disco.numTotalBloques; ++i) {
-        if (disco.bitmapBloquesLibres[i] == 0) {
+    return -1; // No se encontró bloque libre
+}
+
+
+// Funciones para leer/escribir contenido de bloques (texto)
+bool escribir_bloque_raw(int idBloque, const std::string& block_content_text) {
+    if (idBloque < 0 || idBloque >= g_total_bloques) {
+        std::cerr << "Error: ID de bloque fuera de rango: " << idBloque << "\n";
+        return false;
+    }
+
+    int idPlato, idSuperficie, idPista, idSectorGlobal;
+    obtener_coordenadas_fisicas(idBloque, 0, &idPlato, &idSuperficie, &idPista, &idSectorGlobal);
+
+    std::string pista_path = obtener_ruta_pista(idPlato, idSuperficie, idPista);
+    std::fstream file(pista_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo de pista para escribir bloque: " << pista_path << "\n";
+        return false;
+    }
+
+    // Mover el puntero al inicio del bloque dentro del archivo de pista
+    file.seekp(idSectorGlobal * g_tam_sector);
+
+    // Escribir el contenido del bloque. Asegurarse de no exceder TAM_BLOQUE_DEFAULT
+    std::string content_to_write = block_content_text;
+    if (content_to_write.length() > g_tam_bloque) {
+        content_to_write = content_to_write.substr(0, g_tam_bloque);
+        std::cerr << "Advertencia: Contenido del bloque truncado a " << g_tam_bloque << " bytes.\n";
+    } else if (content_to_write.length() < g_tam_bloque) {
+        // Rellenar con nulos si es menor que el tamaño del bloque
+        content_to_write.resize(g_tam_bloque, '\0');
+    }
+
+    file.write(content_to_write.c_str(), g_tam_bloque);
+    file.close();
+    return true;
+}
+
+std::string cargar_bloque_raw(int idBloque) {
+    if (idBloque < 0 || idBloque >= g_total_bloques) {
+        std::cerr << "Error: ID de bloque fuera de rango: " << idBloque << "\n";
+        return "";
+    }
+
+    int idPlato, idSuperficie, idPista, idSectorGlobal;
+    obtener_coordenadas_fisicas(idBloque, 0, &idPlato, &idSuperficie, &idPista, &idSectorGlobal);
+
+    std::string pista_path = obtener_ruta_pista(idPlato, idSuperficie, idPista);
+    std::fstream file(pista_path, std::ios::binary | std::ios::in);
+    if (!file.is_open()) {
+        std::cerr << "Error: No se pudo abrir el archivo de pista para cargar bloque: " << pista_path << "\n";
+        return "";
+    }
+
+    file.seekg(idSectorGlobal * g_tam_sector);
+    std::vector<char> buffer(g_tam_bloque);
+    file.read(buffer.data(), g_tam_bloque);
+    file.close();
+
+    // Convertir el buffer a std::string y eliminar nulos al final si los hay
+    return std::string(buffer.data(), g_tam_bloque);
+}
+
+
+// --- Implementación de funciones de metadatos de tabla y operaciones de registro ---
+
+bool agregar_tabla_a_metadata_cabecera(CabeceraBloque* cabecera, char idTabla, const char* nombreTabla) {
+    if (cabecera == nullptr) return false;
+    cabecera->idTabla = idTabla;
+    strncpy(cabecera->nombreTabla, nombreTabla, MAX_LEN - 1);
+    cabecera->nombreTabla[MAX_LEN - 1] = '\0';
+    cabecera->num_registros = 0;
+    cabecera->bytes_ocupados = sizeof(CabeceraBloque); // Solo la cabecera inicialmente
+    cabecera->siguiente_bloque = -1;
+    // Bitmap inicializado a 0 (libre)
+    memset(cabecera->bitmap_slots, 0, sizeof(cabecera->bitmap_slots));
+    return true;
+}
+
+void mostrar_informacion_disco() {
+    std::cout << "\n--- Información del Disco ---\n";
+    std::cout << "Nombre del Disco: " << g_nombre_disco << "\n";
+    std::cout << "Ruta Base: " << g_ruta_base_disco << "\n";
+    std::cout << "Platos: " << g_num_platos << "\n";
+    std::cout << "Superficies por Plato: " << g_superficies_por_plato << "\n";
+    std::cout << "Pistas por Superficie: " << g_pistas_por_superficie << "\n";
+    std::cout << "Sectores por Pista: " << g_sectores_por_pista << "\n";
+    std::cout << "Tamaño del Sector: " << g_tam_sector << " bytes\n";
+    std::cout << "Tamaño del Bloque: " << g_tam_bloque << " bytes\n";
+    std::cout << "Total de Bloques: " << g_total_bloques << "\n";
+    std::cout << "-----------------------------\n";
+}
+
+void mostrar_informacion_ocupacion_disco() {
+    std::cout << "\n--- Ocupación de Bloques ---\n";
+    int bloques_ocupados = 0;
+    for (int i = 0; i < g_total_bloques; ++i) {
+        if (g_bitmap_bloques[i]) {
+            bloques_ocupados++;
+        }
+    }
+    std::cout << "Bloques Totales: " << g_total_bloques << "\n";
+    std::cout << "Bloques Ocupados: " << bloques_ocupados << "\n";
+    std::cout << "Bloques Libres: " << (g_total_bloques - bloques_ocupados) << "\n";
+    std::cout << "Porcentaje Ocupado: " << std::fixed << std::setprecision(2) << (double)bloques_ocupados / g_total_bloques * 100 << "%\n";
+
+    std::cout << "\n--- Tablas Cargadas ---\n";
+    if (g_numEsquemasCargados == 0) {
+        std::cout << "No hay tablas cargadas.\n";
+    } else {
+        for (int i = 0; i < g_numEsquemasCargados; ++i) {
+            std::cout << "  Tabla: " << g_esquemasCargados[i].nombreTabla
+                      << ", Columnas: " << g_esquemasCargados[i].num_columnas
+                      << ", Registros: " << g_esquemasCargados[i].num_registros
+                      << ", Primer Bloque: " << g_esquemasCargados[i].primer_bloque
+                      << ", Longitud Fija: " << (g_esquemasCargados[i].longitud_fija ? "Sí" : "No")
+                      << ", Tamaño Registro (Fijo): " << g_esquemasCargados[i].tam_registro << "\n";
+            std::cout << "    Esquema: ";
+            for (int j = 0; j < g_esquemasCargados[i].num_columnas; ++j) {
+                std::cout << g_esquemasCargados[i].nombresColumnas[j] << "(" << g_esquemasCargados[i].tiposColumnas[j] << ")" << (j < g_esquemasCargados[i].num_columnas - 1 ? ", " : "");
+            }
+            std::cout << "\n";
+        }
+    }
+    std::cout << "-----------------------------\n";
+}
+
+void mostrar_arbol_creacion_disco(const char* ruta_base, int platos, int superficies, int pistas) {
+    std::cout << "\n--- Árbol de Creación del Disco ---\n";
+    std::cout << ruta_base << "/" << g_nombre_disco << "/\n";
+
+    for (int p = 0; p < platos; ++p) {
+        std::cout << "  |-- Plato" << p << "/\n";
+        for (int s = 0; s < superficies; ++s) {
+            std::cout << "  |    |-- Superficie" << s << "/\n";
+            for (int t = 0; t < pistas; ++t) {
+                std::cout << "  |    |    |-- Pista" << t << ".bin\n";
+            }
+        }
+    }
+    std::cout << "-----------------------------\n";
+}
+
+void imprimir_bloque(int idBloqueGlobal) {
+    std::cout << "\n--- Contenido del Bloque " << idBloqueGlobal << " ---\n";
+    std::string block_content = cargar_bloque_raw(idBloqueGlobal);
+
+    if (block_content.empty()) {
+        std::cout << "Bloque vacío o error al cargar.\n";
+        return;
+    }
+
+    std::cout << "Tamaño del contenido: " << block_content.length() << " bytes\n";
+    std::cout << "Hexdump:\n";
+
+    for (size_t i = 0; i < block_content.length(); ++i) {
+        if (i % 16 == 0) {
+            std::cout << std::setw(8) << std::setfill('0') << std::hex << i << "  ";
+        }
+        std::cout << std::setw(2) << std::setfill('0') << static_cast<int>(static_cast<unsigned char>(block_content[i])) << " ";
+        if ((i + 1) % 16 == 0) {
+            std::cout << " | ";
+            for (int k = (int)i - 15; k <= (int)i; ++k) {
+                char c = block_content[k];
+                if (std::isprint(static_cast<unsigned char>(c))) {
+                    std::cout << c;
+                } else {
+                    std::cout << ".";
+                }
+            }
+            std::cout << "\n";
+        }
+    }
+    // Imprimir los caracteres restantes de la última línea si no terminó en múltiplo de 16
+    if (block_content.length() % 16 != 0) {
+        int remaining_bytes = 16 - (block_content.length() % 16);
+        for (int j = 0; j < remaining_bytes; ++j) {
+            std::cout << "   ";
+        }
+        std::cout << " | ";
+        size_t start_char_index = block_content.length() - (block_content.length() % 16);
+        for (size_t k = start_char_index; k < block_content.length(); ++k) {
+            char c = block_content[k];
+            if (std::isprint(static_cast<unsigned char>(c))) {
+                std::cout << c;
+            } else {
+                std::cout << ".";
+            }
+        }
+        std::cout << "\n";
+    }
+    std::cout << "--------------------------------\n";
+}
+
+// Funciones para buscar y obtener información del esquema
+int buscar_esquema_tabla(const char* nombre_tabla) {
+    for (int i = 0; i < g_numEsquemasCargados; ++i) {
+        if (strcmp(g_esquemasCargados[i].nombreTabla, nombre_tabla) == 0) {
             return i;
         }
+    }
+    return -1; // No encontrada
+}
+
+int obtener_num_columnas_esquema(const char* nombre_tabla) {
+    int idx = buscar_esquema_tabla(nombre_tabla);
+    if (idx != -1) {
+        return g_esquemasCargados[idx].num_columnas;
     }
     return -1;
 }
 
-// Funciones relacionadas con esquemas y registros (Mantener y/o adaptar si necesitan interactuar con BufferManager)
-// Estas funciones ahora necesitarán usar `BufferManager::pinPage` y `BufferManager::unpinPage`
-// para leer y escribir bloques, en lugar de `cargar_bloque_raw` y `escribir_bloque_raw` directamente.
-// Esto es una integración más avanzada que se haría después de verificar que el BufferManager funciona.
-// Por ahora, las mantengo sin cambios, asumiendo que `insertar_registro` etc. todavía operan con un buffer interno
-// o que se modificarán para usar el BufferManager.
-
-
-// Para imprimir_bloque: Ahora leerá el archivo .txt
-void imprimir_bloque(int idBloqueGlobal) {
-    if (!disco.inicializado) { // bitmapBloquesLibres se chequea dentro de cargar_bloque_raw si es necesario
-        std::cerr << "Error: Disco no inicializado." << std::endl;
-        return;
+const char* obtener_tipo_columna_esquema(const char* nombre_tabla, const char* nombre_columna) {
+    int tabla_idx = buscar_esquema_tabla(nombre_tabla);
+    if (tabla_idx != -1) {
+        for (int i = 0; i < g_esquemasCargados[tabla_idx].num_columnas; ++i) {
+            if (strcmp(g_esquemasCargados[tabla_idx].nombresColumnas[i], nombre_columna) == 0) {
+                return g_esquemasCargados[tabla_idx].tiposColumnas[i];
+            }
+        }
     }
-    if (idBloqueGlobal < 0 || idBloqueGlobal >= disco.numTotalBloques) {
-        std::cerr << "Error: ID de bloque fuera de rango: " << idBloqueGlobal << std::endl;
-        return;
-    }
-
-    std::cout << "\n--- Contenido del Bloque " << idBloqueGlobal << " (Texto) ---\n";
-    std::string bloque_data_text = cargar_bloque_raw(idBloqueGlobal); // Usa la nueva función
-
-    if (bloque_data_text.empty()) {
-        std::cerr << "Error: No se pudo cargar el contenido del bloque " << idBloqueGlobal << ".\n";
-        return;
-    }
-
-    // Imprimir la cabecera si es posible, y luego el resto como texto
-    CabeceraBloque temp_cabecera;
-    temp_cabecera.deserializeFromString(bloque_data_text); // Intentar deserializar cabecera
-
-    std::cout << "\n--- Cabecera del Bloque " << idBloqueGlobal << " ---\n";
-    std::cout << " Metadatos de Tablas: \"" << temp_cabecera.tablas_metadata << "\"\n";
-    std::cout << " Numero de Tablas: " << temp_cabecera.numTablas << "\n";
-    std::cout << " Numero de Slots Usados: " << temp_cabecera.numSlotsUsados << "\n";
-    std::cout << " Offset Espacio Libre: " << temp_cabecera.espacioLibreOffset << "\n";
-    std::cout << " Sector de Inicio: " << temp_cabecera.sectorInicio << "\n";
-    std::cout << " Slots:\n";
-    for (int i = 0; i < temp_cabecera.numSlotsUsados; ++i) {
-        std::cout << "   - Slot " << i << ": Offset=" << temp_cabecera.slots[i].offset
-                  << ", Tam=" << temp_cabecera.slots[i].tam
-                  << ", Libre=" << (temp_cabecera.slots[i].libre ? "Sí" : "No")
-                  << ", ID Tabla=" << temp_cabecera.slots[i].idTablaRegistro << "\n";
-    }
-    std::cout << "-------------------------------------------\n";
-
-    // Para el resto del contenido del bloque (los registros), simplemente imprimimos el texto
-    // Esto es solo un ejemplo; la lógica real de parsing de registros debe ser implementada
-    // en funciones específicas de lectura de registros.
-    std::cout << "\n--- Contenido de Registros (Resto del Bloque) ---\n";
-    // Encuentra el final de la cabecera en el string de bloque_data_text
-    size_t end_header_pos = bloque_data_text.find("END_HEADER\n");
-    if (end_header_pos != std::string::npos) {
-        // Los datos de los registros comienzan después de la línea "END_HEADER"
-        std::cout << bloque_data_text.substr(end_header_pos + strlen("END_HEADER\n"));
-    } else {
-        std::cout << "No se encontró el marcador END_HEADER. Mostrando todo el contenido:\n";
-        std::cout << bloque_data_text; // Imprimir todo si no se encuentra el marcador
-    }
-    std::cout << "\n-------------------------------------------\n";
+    return nullptr; // No encontrada
 }
 
-// Las funciones existentes para manejar tablas, inserciones, etc.
-// Necesitarán ser adaptadas para usar `BufferManager::pinPage` y `BufferManager::unpinPage`
-// en lugar de `cargar_bloque_raw` y `escribir_bloque_raw` directamente.
-// Esto es parte de la integración lógica de la base de datos con el buffer.
+const char* obtener_nombre_columna_esquema(const char* nombre_tabla, int index) {
+    int tabla_idx = buscar_esquema_tabla(nombre_tabla);
+    if (tabla_idx != -1 && index >= 0 && index < g_esquemasCargados[tabla_idx].num_columnas) {
+        return g_esquemasCargados[tabla_idx].nombresColumnas[index];
+    }
+    return nullptr;
+}
+
+
+// Operaciones a nivel de tabla
+bool crear_tabla(const char* nombre_tabla, const char* definicion_columnas) {
+    // Implementación similar a handleLoadCsvData, pero con definicion_columnas
+    // No se necesita para el flujo actual de CSV, pero se mantiene la declaración.
+    std::cerr << "La funcion 'crear_tabla' no está completamente implementada para definiciones manuales. Use CSV.\n";
+    return false;
+}
+
+bool guardarEsquema(const char* nombreTabla, char nombresColumnas[][MAX_LEN], char tiposColumnas[][MAX_LEN], int num_columnas) {
+    if (g_numEsquemasCargados >= MAX_NUM_TABLAS_SISTEMA) {
+        std::cerr << "Error: Límite de tablas alcanzado. No se puede guardar más esquemas.\n";
+        return false;
+    }
+    if (buscar_esquema_tabla(nombreTabla) != -1) {
+        std::cerr << "Advertencia: El esquema para la tabla '" << nombreTabla << "' ya existe y se sobrescribirá.\n";
+        // En una implementación real, quizás preguntar al usuario o manejarlo de otra forma.
+        // Por ahora, simplemente actualizamos el existente.
+    }
+
+    int current_idx = buscar_esquema_tabla(nombreTabla);
+    if (current_idx == -1) { // Si no existe, añadir uno nuevo
+        current_idx = g_numEsquemasCargados++;
+    }
+
+    strncpy(g_esquemasCargados[current_idx].nombreTabla, nombreTabla, MAX_LEN - 1);
+    g_esquemasCargados[current_idx].nombreTabla[MAX_LEN - 1] = '\0';
+    g_esquemasCargados[current_idx].num_columnas = num_columnas;
+    g_esquemasCargados[current_idx].num_registros = 0; // Se actualiza al insertar registros
+    g_esquemasCargados[current_idx].primer_bloque = -1; // Se actualiza al insertar el primer registro
+    g_esquemasCargados[current_idx].longitud_fija = false; // Asumir variable por defecto
+    g_esquemasCargados[current_idx].tam_registro = 0;
+
+    for (int i = 0; i < num_columnas; ++i) {
+        strncpy(g_esquemasCargados[current_idx].nombresColumnas[i], nombresColumnas[i], MAX_LEN - 1);
+        g_esquemasCargados[current_idx].nombresColumnas[i][MAX_LEN - 1] = '\0';
+        strncpy(g_esquemasCargados[current_idx].tiposColumnas[i], tiposColumnas[i], MAX_LEN - 1);
+        g_esquemasCargados[current_idx].tiposColumnas[i][MAX_LEN - 1] = '\0';
+    }
+    return true;
+}
+
+// Funciones auxiliares para insertar registros
+bool insertarRegistroLongitudFija(const char* nombreTabla, char valores[][MAX_LEN], int num_valores_fila) {
+    std::cerr << "Inserción de longitud fija no implementada completamente.\n";
+    return false;
+}
+
+bool insertarRegistroLongitudVariable(const char* nombreTabla, char valores[][MAX_LEN], int num_valores_fila) {
+    int tabla_idx = buscar_esquema_tabla(nombreTabla);
+    if (tabla_idx == -1) {
+        std::cerr << "Error: Tabla '" << nombreTabla << "' no encontrada.\n";
+        return false;
+    }
+
+    // Construir el registro como una cadena
+    std::string registro_str;
+    for (int i = 0; i < num_valores_fila; ++i) {
+        registro_str += valores[i];
+        if (i < num_valores_fila - 1) {
+            registro_str += ","; // Separador
+        }
+    }
+    registro_str += "\n"; // Nueva línea al final del registro
+
+    int bloque_actual_id = g_esquemasCargados[tabla_idx].primer_bloque;
+    int prev_bloque_id = -1;
+
+    // Buscar el último bloque de la tabla para añadir el registro
+    while (bloque_actual_id != -1) {
+        std::string block_content = cargar_bloque_raw(bloque_actual_id);
+        CabeceraBloque cabecera;
+        memcpy(&cabecera, block_content.data(), sizeof(CabeceraBloque));
+
+        // Verificar si el registro cabe en el bloque actual (dejando espacio para la cabecera)
+        if ((cabecera.bytes_ocupados + registro_str.length()) <= g_tam_bloque) {
+            // Se puede insertar aquí
+            std::string current_records_content = block_content.substr(sizeof(CabeceraBloque), cabecera.bytes_ocupados - sizeof(CabeceraBloque));
+            current_records_content += registro_str;
+            cabecera.num_registros++;
+            cabecera.bytes_ocupados = sizeof(CabeceraBloque) + current_records_content.length();
+
+            // Reconstruir el contenido completo del bloque
+            std::string new_block_content(reinterpret_cast<const char*>(&cabecera), sizeof(CabeceraBloque));
+            new_block_content += current_records_content;
+
+            escribir_bloque_raw(bloque_actual_id, new_block_content);
+            g_esquemasCargados[tabla_idx].num_registros++;
+            return true;
+        }
+
+        prev_bloque_id = bloque_actual_id;
+        bloque_actual_id = cabecera.siguiente_bloque;
+    }
+
+    // Si no hay bloques o no cabe en los existentes, crear uno nuevo
+    int nuevo_bloque_id = crearNuevoBloque(tabla_idx + 1, nombreTabla); // Usar id de tabla simple
+    if (nuevo_bloque_id == -1) {
+        std::cerr << "Error: No se pudo crear un nuevo bloque para la tabla '" << nombreTabla << "'.\n";
+        return false;
+    }
+
+    // Enlazar el nuevo bloque si no es el primero de la tabla
+    if (prev_bloque_id != -1) {
+        std::string prev_block_content = cargar_bloque_raw(prev_bloque_id);
+        CabeceraBloque prev_cabecera;
+        memcpy(&prev_cabecera, prev_block_content.data(), sizeof(CabeceraBloque));
+        prev_cabecera.siguiente_bloque = nuevo_bloque_id;
+
+        std::string updated_prev_block_content(reinterpret_cast<const char*>(&prev_cabecera), sizeof(CabeceraBloque));
+        updated_prev_block_content += prev_block_content.substr(sizeof(CabeceraBloque), prev_cabecera.bytes_ocupados - sizeof(CabeceraBloque));
+        escribir_bloque_raw(prev_bloque_id, updated_prev_block_content);
+    } else {
+        // Es el primer bloque de la tabla
+        g_esquemasCargados[tabla_idx].primer_bloque = nuevo_bloque_id;
+    }
+
+    // Inicializar y escribir el nuevo bloque con la cabecera y el primer registro
+    CabeceraBloque nueva_cabecera;
+    agregar_tabla_a_metadata_cabecera(&nueva_cabecera, tabla_idx + 1, nombreTabla);
+    nueva_cabecera.num_registros = 1;
+    nueva_cabecera.bytes_ocupados = sizeof(CabeceraBloque) + registro_str.length();
+
+    std::string new_block_content_with_record(reinterpret_cast<const char*>(&nueva_cabecera), sizeof(CabeceraBloque));
+    new_block_content_with_record += registro_str;
+    escribir_bloque_raw(nuevo_bloque_id, new_block_content_with_record);
+
+    g_esquemasCargados[tabla_idx].num_registros++;
+    return true;
+}
+
+bool insertar_registro(const char* nombre_tabla, const char* valores_registro, bool longitud_fija) {
+    // Parsear los valores_registro en el formato char valores[][MAX_LEN]
+    char valores_array[MAX_COLS][MAX_LEN];
+    int num_valores = 0;
+    std::stringstream ss(valores_registro);
+    std::string segment;
+
+    while(std::getline(ss, segment, ',') && num_valores < MAX_COLS) {
+        strncpy(valores_array[num_valores], segment.c_str(), MAX_LEN - 1);
+        valores_array[num_valores][MAX_LEN - 1] = '\0';
+        num_valores++;
+    }
+
+    if (longitud_fija) {
+        return insertarRegistroLongitudFija(nombre_tabla, valores_array, num_valores);
+    } else {
+        return insertarRegistroLongitudVariable(nombre_tabla, valores_array, num_valores);
+    }
+}
+
+
+int buscarBloqueDisponible(const char* nombreTabla, int tamData) {
+    // Si la tabla ya tiene bloques, buscar espacio en ellos primero
+    int tabla_idx = buscar_esquema_tabla(nombreTabla);
+    if (tabla_idx != -1 && g_esquemasCargados[tabla_idx].primer_bloque != -1) {
+        int current_block_id = g_esquemasCargados[tabla_idx].primer_bloque;
+        while (current_block_id != -1) {
+            std::string block_content = cargar_bloque_raw(current_block_id);
+            CabeceraBloque cabecera;
+            memcpy(&cabecera, block_content.data(), sizeof(CabeceraBloque));
+
+            if ((cabecera.bytes_ocupados + tamData) <= g_tam_bloque) {
+                return current_block_id; // Este bloque tiene espacio
+            }
+            current_block_id = cabecera.siguiente_bloque;
+        }
+    }
+
+    // Si no se encontró espacio en bloques existentes de la tabla o no tiene bloques, buscar uno libre
+    return encontrar_bloque_libre();
+}
+
+int crearNuevoBloque(char idTabla, const char* nombreTabla) {
+    int nuevo_bloque_id = encontrar_bloque_libre();
+    if (nuevo_bloque_id == -1) {
+        std::cerr << "Error: No hay bloques libres en el disco.\n";
+        return -1;
+    }
+
+    marcar_bloque_ocupado(nuevo_bloque_id);
+
+    // Inicializar el bloque con una cabecera
+    CabeceraBloque nueva_cabecera;
+    agregar_tabla_a_metadata_cabecera(&nueva_cabecera, idTabla, nombreTabla);
+
+    // Escribir la cabecera al inicio del bloque
+    std::string initial_content(reinterpret_cast<const char*>(&nueva_cabecera), sizeof(CabeceraBloque));
+    // Rellenar el resto del bloque con nulos
+    initial_content.resize(g_tam_bloque, '\0');
+
+    if (escribir_bloque_raw(nuevo_bloque_id, initial_content)) {
+        return nuevo_bloque_id;
+    } else {
+        marcar_bloque_libre(nuevo_bloque_id); // Liberar si falla la escritura
+        return -1;
+    }
+}
+
+
+TablaMetadataBypass* obtener_esquema_tabla_global(const char* nombre_tabla) {
+    int idx = buscar_esquema_tabla(nombre_tabla);
+    if (idx != -1) {
+        return &g_esquemasCargados[idx];
+    }
+    return nullptr;
+}

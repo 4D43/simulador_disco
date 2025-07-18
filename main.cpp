@@ -3,30 +3,23 @@
 #include <string>
 #include <vector>
 #include <cstdio>
-#include <fstream>
-#include <cstring>
-#include <sstream>
-#include <algorithm>
-#include <iomanip>
+#include <fstream> // Para cargar esquema_gestor.txt
+#include <cstring> // Para strtok
+#include <sstream> // Para std::stringstream
+#include <algorithm> // Para std::replace
+#include <iomanip> // Para std::setw
+
 
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // Para SetConsoleOutputCP y CP_UTF8
 #else
-#include <clocale>
+#include <clocale>   // Para std::setlocale
 #endif
 
-#include "Disco.h" // Incluye las nuevas definiciones del BufferManager
-
-// Variables globales si es necesario, o pasar instancias
-extern Disco disco; // Asegúrate de que Disco esté disponible globalmente o se pase
-
-// Prototipos de funciones globales (ya definidos en Disco.h, pero útiles para la claridad de main.cpp)
-void inicializarSistemaGestor();
-bool guardarEstadoSistema();
-void handleCreateNewDisk();
-void handleLoadExistingDisk();
-bool handleLoadCsvData();
-void handleDiskDependentOperation(int opcion);
+#include "Disco.h"
+#include "BufferManager.h" // Incluir el BufferManager
+#include "gestor.h"
+#include "globals.h" // Incluir el archivo de variables globales
 
 // Limpia el buffer de entrada para evitar problemas con std::getline
 void clearInputBuffer() {
@@ -43,164 +36,155 @@ void mostrarMenu() {
     std::cout << "6. Mostrar información de ocupación del disco\n";
     std::cout << "7. Mostrar árbol de creación del disco\n";
     std::cout << "8. Administrar Buffer Pool\n"; // Nueva opción
-    std::cout << "9. Salir\n";
-    std::cout << "Seleccione una opción: ";
+    std::cout << "9. Crear Tabla\n"; // Nueva opción para crear tabla
+    std::cout << "10. Insertar Registro\n"; // Nueva opción para insertar registro
+    std::cout << "11. Imprimir Bloque\n"; // Nueva opción para imprimir bloque
+    std::cout << "12. Salir y Guardar\n"; // Cambiado el número
+    std::cout << "----------------------\n";
+    std::cout << "Seleccione una opcion: ";
 }
 
-// Nueva función manejarBufferPool
-void manejarBufferPool(BufferManager& buffer_manager) {
-    int opcion_buffer;
-    do {
-        std::cout << "\n--- MENÚ DEL BUFFER POOL (Algoritmo Actual: " << (buffer_manager.getSelectedAlgorithm() == BufferAlgorithm::LRU ? "LRU" : "CLOCK") << ") ---\n";
-        std::cout << "1. Configurar Algoritmo\n";
-        std::cout << "2. Agregar página al Buffer Pool (Pin Block ID)\n";
-        std::cout << "3. Mostrar estado del Buffer Pool\n";
-        std::cout << "4. Acceder/Re-pinear una página (Actualiza referencia/uso)\n";
-        // La opción 5 (Actualizar una página) es cubierta por pinear en modo escritura y despinear como dirty.
-        // Se puede añadir una opción de "modificar contenido de página en buffer" si se desea.
-        std::cout << "5. Despinear página\n";
-        std::cout << "6. Establecer tamaño máximo del Buffer Pool\n";
-        std::cout << "7. Guardar todas las páginas sucias a disco (Flush All)\n";
-        std::cout << "8. Salir al menú principal\n";
-        std::cout << "Seleccione una opción: ";
+// Declaraciones de funciones para los handlers
+void handleCreateNewDisk();
+void handleLoadExistingDisk();
+bool handleLoadCsvDataWrapper(); // Wrapper para llamar a la función de Disco.cpp
+void handleDiskDependentOperation(int opcion);
+void handleCreateTable();
+void handleInsertRecord(BufferManager& buffer_manager); // Necesita el BufferManager
+void handlePrintBlock(BufferManager& buffer_manager); // Necesita el BufferManager
 
-        if (!(std::cin >> opcion_buffer)) {
+
+// Función para manejar el Buffer Pool (Opción 8)
+void manejarBufferPool(BufferManager& buffer_manager) {
+    int opcion_bm;
+    do {
+        std::cout << "\n--- Administracion de Buffer Pool ---\n";
+        std::cout << "1. Mostrar estado del Buffer Pool\n";
+        std::cout << "2. Volcar todas las paginas sucias a disco\n";
+        std::cout << "3. Volver al Menu Principal\n";
+        std::cout << "Seleccione una opcion: ";
+        if (!(std::cin >> opcion_bm)) {
             std::cin.clear();
             clearInputBuffer();
-            std::cout << "Entrada inválida. Intente de nuevo.\n";
+            std::cout << "Entrada invalida. Intente de nuevo.\n";
             continue;
         }
         clearInputBuffer();
 
-        switch (opcion_buffer) {
-            case 1: { // Configurar Algoritmo
-                int algo_choice;
-                std::cout << "Seleccione algoritmo (1 para LRU, 2 para CLOCK): ";
-                if (!(std::cin >> algo_choice)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida.\n"; break;
-                }
-                clearInputBuffer();
-                if (algo_choice == 1) {
-                    buffer_manager.setAlgorithm(BufferAlgorithm::LRU);
-                } else if (algo_choice == 2) {
-                    buffer_manager.setAlgorithm(BufferAlgorithm::CLOCK);
-                } else {
-                    std::cout << "Opción de algoritmo inválida.\n";
-                }
+        switch (opcion_bm) {
+            case 1:
+                buffer_manager.printBufferPoolStatus();
                 break;
-            }
-            case 2: { // Agregar página al Buffer Pool (Pin Page)
-                int page_id;
-                char mode_char;
-                std::cout << "Ingrese el ID del bloque/página a pinear (ej. 101): ";
-                if (!(std::cin >> page_id)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida para ID de página.\n"; break;
-                }
-                clearInputBuffer();
-                std::cout << "¿Desea pinear la página en modo lectura (r) o escritura (w)? ";
-                std::cin >> mode_char;
-                clearInputBuffer();
-                if (mode_char != 'r' && mode_char != 'R' && mode_char != 'w' && mode_char != 'W') {
-                    std::cout << "Modo de acceso inválido. Use 'r' o 'w'.\n"; break;
-                }
-                std::string content = buffer_manager.pinPage(page_id, mode_char);
-                if (!content.empty()) {
-                    std::cout << "Contenido de la página (primeros 100 chars): " << content.substr(0, std::min((size_t)100, content.length())) << "...\n";
-                }
+            case 2:
+                buffer_manager.flushAllPages();
                 break;
-            }
-            case 3: // Mostrar estado del Buffer Pool
-                buffer_manager.printBufferTable();
-                break;
-            case 4: { // Acceder/Re-pinear una página
-                int page_id;
-                char mode_char;
-                std::cout << "Ingrese el ID de la página a acceder (ya en el buffer o para cargar): ";
-                if (!(std::cin >> page_id)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida.\n"; break;
-                }
-                clearInputBuffer();
-                std::cout << "¿Desea acceder en modo lectura (r) o escritura (w)? ";
-                std::cin >> mode_char;
-                clearInputBuffer();
-                if (mode_char != 'r' && mode_char != 'R' && mode_char != 'w' && mode_char != 'W') {
-                    std::cout << "Modo de acceso inválido. Use 'r' o 'w'.\n"; break;
-                }
-                std::string content = buffer_manager.pinPage(page_id, mode_char); // Usar pinPage para acceder
-                 if (!content.empty()) {
-                    std::cout << "Contenido de la página (primeros 100 chars): " << content.substr(0, std::min((size_t)100, content.length())) << "...\n";
-                }
-                break;
-            }
-            case 5: { // Despinear página
-                int frame_id;
-                int is_dirty_input;
-                bool is_dirty_bool;
-                std::cout << "Ingrese el Frame ID de la página a despinear: ";
-                if (!(std::cin >> frame_id)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida.\n"; break;
-                }
-                clearInputBuffer();
-                std::cout << "¿La página fue modificada y está sucia? (1 para SÍ, 0 para NO): ";
-                if (!(std::cin >> is_dirty_input)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida.\n"; break;
-                }
-                clearInputBuffer();
-                is_dirty_bool = (is_dirty_input == 1);
-                buffer_manager.unpinPage(frame_id, is_dirty_bool);
-                break;
-            }
-            case 6: { // Establecer tamaño máximo del Buffer Pool
-                int new_size;
-                std::cout << "Ingrese el nuevo tamaño máximo del Buffer Pool: ";
-                if (!(std::cin >> new_size)) {
-                    std::cin.clear(); clearInputBuffer(); std::cout << "Entrada inválida.\n"; break;
-                }
-                clearInputBuffer();
-                buffer_manager.resizeBuffer(new_size);
-                break;
-            }
-            case 7: { // Guardar todas las páginas sucias (Flush All)
-                for (int i = 0; i < buffer_manager.getMaxPages(); ++i) {
-                    // Acceder al buffer_pool a través de un getter si es privado
-                    if (buffer_manager.getBufferPool()[i].dirty_bit) {
-                        buffer_manager.flushPage(i);
-                    }
-                }
-                std::cout << "Todas las páginas sucias han sido intentadas guardar en disco.\n";
-                break;
-            }
-            case 8:
-                std::cout << "Saliendo del menú del Buffer Pool.\n";
+            case 3:
+                std::cout << "Volviendo al menu principal.\n";
                 break;
             default:
-                std::cout << "Opción inválida. Seleccione un número del menú.\n";
+                std::cout << "Opcion invalida.\n";
                 break;
         }
-    } while (opcion_buffer != 8); // Cambiado a 8 para salir
+    } while (opcion_bm != 3);
 }
 
-// Función principal
+// Implementaciones de los handlers
+void handleCreateNewDiskk() {
+    std::string nombre_disco;
+    int platos, superficies, pistas, sectores, tam_sector;
+
+    std::cout << "Ingrese nombre del nuevo disco: ";
+    std::getline(std::cin, nombre_disco);
+
+    std::cout << "Ingrese cantidad de platos: ";
+    std::cin >> platos;
+    std::cout << "Ingrese cantidad de superficies por plato: ";
+    std::cin >> superficies;
+    std::cout << "Ingrese cantidad de pistas por superficie: ";
+    std::cin >> pistas;
+    std::cout << "Ingrese cantidad de sectores por pista: ";
+    std::cin >> sectores;
+    std::cout << "Ingrese tamano del sector (bytes): ";
+    std::cin >> tam_sector;
+    clearInputBuffer(); // Limpiar después de leer enteros
+
+    handleCreateNewDisk();
+}
+
+void handleDiskDependentOperations(int opcion) {
+    if (NOMBRE_DISCO_LEN == 0) {
+        std::cout << "No hay ningun disco cargado. Por favor, cree o cargue un disco primero.\n";
+        return;
+    }
+
+    switch (opcion) {
+        case 6:
+            mostrar_informacion_ocupacion_disco();
+            break;
+        case 7:
+            mostrar_arbol_creacion_disco(obtenerRutaBase(), g_num_platos, g_superficies_por_plato, g_pistas_por_superficie);
+            break;
+        case 4: // Select
+            std::cout << "Funcionalidad SELECT aun no implementada con Buffer Manager.\n";
+            break;
+        case 5: // Delete
+            std::cout << "Funcionalidad DELETE aun no implementada con Buffer Manager.\n";
+            break;
+        default:
+            std::cout << "Opcion no reconocida para operaciones de disco.\n";
+            break;
+    }
+}
+
+void handleExecuteSQLQuery(BufferManager& buffer_manager) {
+    if (NOMBRE_DISCO_LEN == 0) {
+        std::cout << "No hay ningun disco cargado. Por favor, cree o cargue un disco primero.\n";
+        return;
+    }
+
+    leerEntrada(); // Lee la consulta SQL del usuario
+
+    // Procesa la consulta para identificar el tipo de comando (SELECT o INSERT)
+    // y extraer información como nombre de tabla, columnas, etc.
+    validarTamano();
+    procesarConsulta();
+    analizarComandos();
+    analizarCondiciones();
+    imprimirArbolSemantico();
+
+    // Dependiendo del comando identificado, llama a la función correspondiente
+    // Los comandos son detectados por `analizarComandos` y almacenados en `analisis[0]`
+    // Por ejemplo, "SELECT" o "INSERT"
+
+    if (tamano > 0) {
+        if (strcmp(analisis[0], "SELECT") == 0) {
+            seleccionar(buffer_manager);
+        } else if (strcmp(analisis[0], "INSERT") == 0 && tamano > 1 && strcmp(analisis[1], "INTO") == 0) {
+            ingresar(buffer_manager);
+        } else {
+            std::cout << "Comando SQL no reconocido o no implementado.\n";
+        }
+    } else {
+        std::cout << "No se ingreso ninguna consulta SQL.\n";
+    }
+}
+
 int main() {
+    // Configurar la consola para UTF-8 si es Windows
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #else
     std::setlocale(LC_ALL, "en_US.UTF-8");
 #endif
-    std::cout << "Iniciando sistema de gestión de disco...\n";
-    inicializarSistemaGestor();
 
-    // Declarar el BufferManager. La ruta de bloques se actualizará dinámicamente.
-    // Se inicializa con una ruta temporal o se pasa una referencia para actualizarla después.
-    // Lo ideal es que el BufferManager sepa cuál es el disco activo.
-    // Por simplicidad, se inicializa con una ruta base y se actualiza después.
-    char initial_blocks_path[MAX_RUTA];
-    // Asumimos un disco "temp_disk" o vacío al inicio. La ruta real será configurada
-    // cuando se cree o cargue un disco.
-    snprintf(initial_blocks_path, MAX_RUTA, "Discos/temp_disk/Bloques"); // Ruta placeholder
-    BufferManager buffer_manager(3, initial_blocks_path, BufferAlgorithm::LRU); // Inicializar con LRU por defecto
+    std::cout << "Iniciando Sistema Gestor de Bases de Datos...\n";
+    inicializarSistemaGestor(); // Carga el estado del disco y esquemas
 
     int opcion = 0;
+    // Inicializar el Buffer Manager con 3 páginas y ruta de bloques
+    // La ruta de bloques debe coincidir con la de tu disco
+    BufferManager buffer_manager(3, "C:/Users/diogo/OneDrive/Documentos/pebd/prot_disco - copia/Discos/d4/Bloques");
+
     do {
         mostrarMenu();
         if (!(std::cin >> opcion)) {
@@ -213,122 +197,102 @@ int main() {
 
         switch (opcion) {
             case 1:
-                handleCreateNewDisk();
-                // Después de crear un disco, actualizar la ruta de bloques del BufferManager
-                {
-                    char current_blocks_path[MAX_RUTA];
-                    construir_ruta_bloque(current_blocks_path); // Usa disco.nombre internamente
-                    buffer_manager.setBlocksDirectoryPath(current_blocks_path);
-                }
+                handleCreateNewDiskk();
                 break;
             case 2:
                 handleLoadExistingDisk();
-                // Después de cargar un disco, actualizar la ruta de bloques del BufferManager
-                {
-                    char current_blocks_path[MAX_RUTA];
-                    construir_ruta_bloque(current_blocks_path); // Usa disco.nombre internamente
-                    buffer_manager.setBlocksDirectoryPath(current_blocks_path);
-                }
                 break;
             case 3:
-                if(!handleLoadCsvData())
+                if(!handleLoadCsvDataWrapper()) // Se ha renombrado para evitar conflicto con la función original
                     std::cerr << "Error al cargar datos desde CSV.\n";
                 break;
-            case 4: // Ejecutar consulta SQL (SELECT)
-            case 5: // Eliminar registros
-            case 6: // Mostrar información de ocupación del disco
-            case 7: // Mostrar árbol de creación del disco
-                // Estas operaciones deberían interactuar con el Buffer Manager para obtener/modificar bloques.
-                // Aquí, necesitas modificar las implementaciones de estas funciones.
-                // Por ejemplo, dentro de 'handleDiskDependentOperation':
-                // En lugar de `cargar_bloque_raw(id_bloque, buffer_data)`, usar `buffer_manager.pinPage(id_bloque, 'r')` o 'w'.
-                // Y al finalizar, `buffer_manager.unpinPage(frame_id, is_dirty)`.
-                handleDiskDependentOperation(opcion);
+            case 4:
+                handleExecuteSQLQuery(buffer_manager);
                 break;
-            case 8: // Administrar Buffer Pool
-                manejarBufferPool(buffer_manager);
+            case 5:
+            case 6:
+            case 7:
+                handleDiskDependentOperations(opcion); // Estas operaciones podrían necesitar el BM
+                break;
+            case 8:
+                manejarBufferPool(buffer_manager); // Manejar el Buffer Pool
                 break;
             case 9:
-                std::cout << "Saliendo y guardando estado...\\n";
-                // Al salir, vaciar todas las páginas sucias del buffer
-                for (int i = 0; i < buffer_manager.getMaxPages(); ++i) {
-                    if (buffer_manager.getBufferPool()[i].dirty_bit) {
-                        buffer_manager.flushPage(i);
-                    }
-                }
+                handleCreateTable();
+                break;
+            case 10:
+                handleInsertRecord(buffer_manager); // Pasando el BufferManager
+                break;
+            case 11:
+                handlePrintBlock(buffer_manager); // Pasando el BufferManager
+                break;
+            case 12: // La opción de salir ahora es 12
+                std::cout << "Saliendo y guardando estado...\n";
                 guardarEstadoSistema();
                 break;
             default:
-                std::cout << "Opción inválida. Seleccione número del 1 al 9.\\n";
+                std::cout << "Opción inválida. Seleccione número del menu.\n";
                 break;
         }
-    } while (opcion != 9);
+    } while (opcion != 12); // Condición de salida actualizada
 
     return 0;
 }
 
-// Las implementaciones de las funciones auxiliares (handleCreateNewDisk, etc.)
-// irían aquí o en otro .cpp si están separadas. Asegúrate de que usen BufferManager.
-// Por ejemplo, handleCreateNewDisk:
-// * Asegúrate de que `disco.bitmapBloquesLibres` se asigne con `new int[MAX_BLOQUES];`
-// * Y en algún destructor o lógica de cierre, `delete[] disco.bitmapBloquesLibres;`
-// Es crucial que el manejo de registros (inserción, selección, eliminación)
-// use el BufferManager (`pinPage`, `unpinPage`, etc.) en lugar de operaciones directas
-// de lectura/escritura de bloques.
 
-// Ejemplo de cómo handleDiskDependentOperation (o las funciones de SQL internas)
-// deberían usar el BufferManager:
-/*
-// Supongamos que esta función necesita leer un bloque específico
-void some_sql_query_handler(int block_id, BufferManager& bm) {
-    // Pinear la página para lectura
-    std::string block_content = bm.pinPage(block_id, 'r');
-    if (!block_content.empty()) {
-        // ... procesar el contenido del bloque ...
-        std::cout << "Contenido del bloque " << block_id << ": " << block_content.substr(0, 50) << "...\n";
 
-        // Obtener el frame_id para despinear (necesitarás rastrearlo, quizás `pinPage` podría devolver `pair<string, int>`)
-        // O buscar el frame_id basado en page_id
-        int frame_id_found = -1;
-        for(int i=0; i<bm.getMaxPages(); ++i) {
-            if (bm.getBufferPool()[i].page_id == block_id) {
-                frame_id_found = i;
-                break;
-            }
-        }
-        if (frame_id_found != -1) {
-            bm.unpinPage(frame_id_found, false); // No se modificó, no está sucia
-        }
-    }
+// Wrapper para handleLoadCsvData de Disco.cpp
+// NOTA: Esta función en Disco.cpp aún necesita ser actualizada para aceptar BufferManager
+bool handleLoadCsvDataWrapper() {
+    // Temporalmente, handleLoadCsvData en Disco.cpp no acepta BufferManager.
+    // Esto es un placeholder; necesitas modificar esa función para que lo acepte.
+    std::cout << "La carga de CSV requiere pasar el BufferManager, que aun no esta implementado en la funcion de Disco.cpp. Por favor, actualicela." << std::endl;
+    return false; // handleLoadCsvData();
 }
 
-// Supongamos que esta función necesita modificar un bloque
-void some_insert_update_handler(int block_id, BufferManager& bm, const std::string& new_content) {
-    // Pinear la página para escritura
-    std::string current_block_content = bm.pinPage(block_id, 'w'); // Esto marca la página como sucia
-    if (!current_block_content.empty()) {
-        // ... modificar el contenido del bloque (new_content) ...
-        // Aquí debes parsear current_block_content, modificar los registros,
-        // y luego actualizar `buffer_manager.getBufferPool()[frame_id].data = new_content;`
-        // Esto es la parte más compleja de la integración con tu gestor de registros.
-        // Después de modificar el string 'data' en la página del buffer:
+void handleCreateTable() {
+    std::string nombre_tabla;
+    std::string definicion_columnas; // Ej: "id:INT,nombre:CHAR(50),edad:INT"
 
-        // Obtener el frame_id
-        int frame_id_found = -1;
-        for(int i=0; i<bm.getMaxPages(); ++i) {
-            if (bm.getBufferPool()[i].page_id == block_id) {
-                frame_id_found = i;
-                break;
-            }
-        }
-        if (frame_id_found != -1) {
-            // Asigna el nuevo contenido al buffer_pool[frame_id].data
-            // bm.getBufferPool()[frame_id_found].data = new_content; // Esto requiere que buffer_pool sea mutable o un setter
-            // Es mejor que `pinPage` devuelva una referencia a `std::string& data` o un puntero, o que haya un `updatePageContent(frame_id, new_data)`
-            // Por simplicidad, se asumirá que se puede modificar directamente la cadena de `data` devuelta por `pinPage`
-            // o que hay un método para actualizar el contenido de la página en el buffer.
-            bm.unpinPage(frame_id_found, true); // Se modificó, marcar como sucia
-        }
-    }
+    std::cout << "Ingrese el nombre de la tabla a crear: ";
+    std::getline(std::cin, nombre_tabla);
+    std::cout << "Ingrese la definicion de columnas (ej. id:INT,nombre:CHAR(50)): ";
+    std::getline(std::cin, definicion_columnas);
+
+    crear_tabla(nombre_tabla.c_str(), definicion_columnas.c_str());
 }
-*/
+
+void handleInsertRecord(BufferManager& buffer_manager) {
+    std::string nombre_tabla;
+    std::string valores_registro_str; // Ej: "1|Juan Perez|25"
+
+    std::cout << "Ingrese el nombre de la tabla: ";
+    std::getline(std::cin, nombre_tabla);
+
+    int tabla_idx = buscar_esquema_tabla(nombre_tabla.c_str());
+    if (tabla_idx == -1) {
+        std::cerr << "Error: La tabla '" << nombre_tabla << "' no existe.\n";
+        return;
+    }
+
+    std::cout << "Ingrese los valores del registro separados por '|' (ej. 1|Juan Perez|25): ";
+    std::getline(std::cin, valores_registro_str);
+
+    // Determinar si la tabla es de longitud fija o variable
+    bool longitud_fija = g_esquemasCargados[tabla_idx].longitud_fija;
+
+    insertar_registro(nombre_tabla.c_str(), valores_registro_str.c_str(), longitud_fija);
+}
+
+void handlePrintBlock(BufferManager& buffer_manager) {
+    int id_bloque;
+    std::cout << "Ingrese el ID del bloque a imprimir: ";
+    if (!(std::cin >> id_bloque)) {
+        std::cin.clear();
+        clearInputBuffer();
+        std::cout << "Entrada invalida. Intente de nuevo.\n";
+        return;
+    }
+    clearInputBuffer();
+    imprimir_bloque(id_bloque);
+}
